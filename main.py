@@ -5,6 +5,8 @@ import sqlite3
 import datetime as dt
 from pathlib import Path
 from typing import Optional, Tuple
+from flask import Flask
+from threading import Thread
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -91,6 +93,29 @@ ADMIN_IDS = {
     for x in ADMIN_IDS_RAW.split(",")
     if x.strip().isdigit()
 }
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ===== ВЕБ-СЕРВЕР ДЛЯ RENDER =====
+app = Flask(__name__)
+
+@app.route('/')
+@app.route('/ping')
+@app.route('/health')
+def home():
+    return "✅ Бот работает!"
+
+def run_web():
+    """Запускает веб-сервер"""
+    port = int(os.environ.get('PORT', 8080))
+    logger.info(f"🚀 Запуск веб-сервера на порту {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
+
+# Запускаем веб-сервер в отдельном потоке
+web_thread = Thread(target=run_web, daemon=True)
+web_thread.start()
+logger.info("✅ Веб-сервер запущен в фоне")
 
 # 3x-ui панель
 XUI_BASE_URL = os.getenv("XUI_BASE_URL", "https://151.241.215.71:49652/G9Z6TrOp6WywHYibcI/")
