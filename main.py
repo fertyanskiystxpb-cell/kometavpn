@@ -5,8 +5,6 @@ import sqlite3
 import datetime as dt
 from pathlib import Path
 from typing import Optional, Tuple
-from flask import Flask
-from threading import Thread
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -22,47 +20,82 @@ from aiogram.types import (
     BufferedInputFile,
 )
 
-from database import (
-    init_db,
-    get_or_create_user,
-    get_user_by_telegram_id,
-    get_user_with_subscription,
-    has_active_subscription,
-    list_users_with_latest_subscription,
-    create_active_subscription_for_telegram,
-    list_used_keys,
-    create_active_subscription_with_key,
-    revoke_active_subscription_for_telegram,
-    expire_outdated_subscriptions,
-    reset_all_keys,
-    reset_keys_by_keys,
-    reset_keys_from_set,
-    get_total_issued_keys_count,
-    has_used_trial,
-    mark_trial_used,
-    get_all_telegram_ids,
-    update_user_subscription_key,
-    update_user,
-    get_referral_stats,
-    reset_trial_for_user,
-    delete_user_completely,
-    extend_active_subscription_by_days,
-    set_user_api_client,
-    list_expired_api_clients,
-    clear_user_api_client,
-)
 from dotenv import load_dotenv
+
+load_dotenv()
+
+# PostgreSQL на Render: при наличии DATABASE_URL используем database_pg
+if os.getenv("DATABASE_URL"):
+    from database_pg import (
+        init_db,
+        get_or_create_user,
+        get_user_by_telegram_id,
+        get_user_with_subscription,
+        has_active_subscription,
+        list_users_with_latest_subscription,
+        create_active_subscription_for_telegram,
+        list_used_keys,
+        create_active_subscription_with_key,
+        revoke_active_subscription_for_telegram,
+        expire_outdated_subscriptions,
+        reset_all_keys,
+        reset_keys_by_keys,
+        reset_keys_from_set,
+        get_total_issued_keys_count,
+        has_used_trial,
+        mark_trial_used,
+        get_all_telegram_ids,
+        update_user_subscription_key,
+        update_user,
+        get_referral_stats,
+        reset_trial_for_user,
+        delete_user_completely,
+        extend_active_subscription_by_days,
+        set_user_api_client,
+        list_expired_api_clients,
+        clear_user_api_client,
+        set_referrer_for_user,
+    )
+else:
+    from database import (
+        init_db,
+        get_or_create_user,
+        get_user_by_telegram_id,
+        get_user_with_subscription,
+        has_active_subscription,
+        list_users_with_latest_subscription,
+        create_active_subscription_for_telegram,
+        list_used_keys,
+        create_active_subscription_with_key,
+        revoke_active_subscription_for_telegram,
+        expire_outdated_subscriptions,
+        reset_all_keys,
+        reset_keys_by_keys,
+        reset_keys_from_set,
+        get_total_issued_keys_count,
+        has_used_trial,
+        mark_trial_used,
+        get_all_telegram_ids,
+        update_user_subscription_key,
+        update_user,
+        get_referral_stats,
+        reset_trial_for_user,
+        delete_user_completely,
+        extend_active_subscription_by_days,
+        set_user_api_client,
+        list_expired_api_clients,
+        clear_user_api_client,
+        set_referrer_for_user,
+    )
 
 from xui_controller import XUIController, generate_vless_link
 
 
-load_dotenv()
-
 async def check_and_expire_subscriptions():
-    """Проверяет и обновляет статус просроченных подписок"""
+    """Проверяет и обновляет статус просроченных подписок в БД."""
     expired_count = await expire_outdated_subscriptions()
     if expired_count > 0:
-        logger.info(f"Автоматически аннулировано {expired_count} просроченных подписок")
+        logger.info("expire_subscriptions: expired_count=%s, status=db_updated", expired_count)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8061067527:AAGc8Cz6yrQW5j5CD8HAxWleXO_vKj8Rw6Y")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "8516740130")
@@ -94,29 +127,6 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ===== ВЕБ-СЕРВЕР ДЛЯ RENDER =====
-app = Flask(__name__)
-
-@app.route('/')
-@app.route('/ping')
-@app.route('/health')
-def home():
-    return "✅ Бот работает!"
-
-def run_web():
-    """Запускает веб-сервер"""
-    port = int(os.environ.get('PORT', 8080))
-    logger.info(f"🚀 Запуск веб-сервера на порту {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
-
-# Запускаем веб-сервер в отдельном потоке
-web_thread = Thread(target=run_web, daemon=True)
-web_thread.start()
-logger.info("✅ Веб-сервер запущен в фоне")
-
 # 3x-ui панель
 XUI_BASE_URL = os.getenv("XUI_BASE_URL", "https://151.241.215.71:49652/G9Z6TrOp6WywHYibcI/")
 XUI_USERNAME = os.getenv("XUI_USERNAME", "velolider")
@@ -141,37 +151,20 @@ def get_xui() -> XUIController:
 async def issue_subscription_key(
     telegram_id: int,
     duration_days: int,
-    keys_file: Optional[Path],
+    keys_file: Optional[Path] = None,
 ) -> Optional[Tuple[str, bool]]:
     """
-    Выдаёт подписку: сначала пробует ключ из файла, при отсутствии — создаёт клиента через API.
-    Возвращает (ключ_или_vless_ссылка, is_api) или None при ошибке.
+    Выдаёт подписку только через API панели (выдача из .txt отключена).
+    Legacy-пользователи с уже выданными ключами из файлов не затрагиваются.
+    Возвращает (vless_ссылка, True) или None при ошибке.
     """
-    used_keys = set(await list_used_keys())
-    if keys_file and keys_file.exists():
-        try:
-            with keys_file.open("r", encoding="utf-8") as f:
-                all_keys = [line.strip() for line in f if line.strip()]
-        except Exception as e:
-            logger.warning("Не удалось прочитать файл ключей %s: %s", keys_file, e)
-            all_keys = []
-        for k in all_keys:
-            if k not in used_keys:
-                ok = await create_active_subscription_with_key(
-                    telegram_id=telegram_id,
-                    duration_days=duration_days,
-                    key=k,
-                )
-                if ok:
-                    return (k, False)
-                return None
-    # Нет ключа из файла — создаём через API
     controller = get_xui()
     if not await controller.ensure_logged_in():
-        logger.error("XUI: не удалось авторизоваться")
+        logger.error("issue_subscription_key: user_id=%s, key_type=API, status=login_failed", telegram_id)
         return None
     uuid_str = await controller.add_user(telegram_id, duration_days)
     if not uuid_str:
+        logger.error("issue_subscription_key: user_id=%s, key_type=API, status=addClient_failed", telegram_id)
         return None
     ok = await create_active_subscription_with_key(
         telegram_id=telegram_id,
@@ -179,8 +172,10 @@ async def issue_subscription_key(
         key=uuid_str,
     )
     if not ok:
+        logger.error("issue_subscription_key: user_id=%s, key_type=API, status=db_create_failed", telegram_id)
         return None
     await set_user_api_client(telegram_id, uuid_str)
+    logger.info("issue_subscription_key: user_id=%s, key_type=API, status=success, uuid=%s", telegram_id, uuid_str)
     return (generate_vless_link(uuid_str, f"Kometa-tg_{telegram_id}"), True)
 
 
@@ -273,7 +268,7 @@ async def periodic_expiration_check():
         try:
             expired_count = await expire_outdated_subscriptions()
             if expired_count > 0:
-                logger.info(f"Периодическая проверка: аннулировано {expired_count} просроченных подписок")
+                logger.info("periodic_expire: expired_count=%s, key_type=mixed, status=db_updated", expired_count)
 
             expired_api = await list_expired_api_clients()
             if expired_api:
@@ -282,11 +277,13 @@ async def periodic_expiration_check():
                     for telegram_id, client_uuid in expired_api:
                         if await controller.delete_user(client_uuid):
                             await clear_user_api_client(telegram_id)
-                            logger.info("Удалён API-клиент tg_%s uuid=%s", telegram_id, client_uuid)
+                            logger.info("periodic_expire: user_id=%s, key_type=API, status=success, panel=deleted, db=cleared, uuid=%s", telegram_id, client_uuid)
                         else:
-                            logger.warning("Не удалось удалить API-клиента uuid=%s", client_uuid)
+                            logger.info("periodic_expire: user_id=%s, key_type=API, status=panel_delete_failed, uuid=%s", telegram_id, client_uuid)
+                else:
+                    logger.warning("periodic_expire: status=login_failed, pending_api_deletes=%s", len(expired_api))
         except Exception as e:
-            logger.error(f"Ошибка при проверке просроченных подписок / API: {e}")
+            logger.error("periodic_expire: status=error, error=%s", e)
         await asyncio.sleep(3600)
 
 async def main() -> None:
@@ -392,106 +389,108 @@ async def process_referral_after_subscription(user_id: int, referrer_id: int, bo
         logger.info(f"Пользователь {user_id} уже имеет реферера {user.get('referrer_id')}, пропускаем")
         return
     
-    # Устанавливаем referrer_id пользователю
-    from database import DB_PATH
-    loop = asyncio.get_running_loop()
-    def _set_referrer() -> bool:
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE users SET referrer_id = ? WHERE telegram_id = ? AND referrer_id IS NULL",
-                (referrer_id, user_id),
-            )
-            conn.commit()
-            if cur.rowcount > 0:
-                # Увеличиваем счётчик рефералов у реферера
-                cur.execute(
-                    "UPDATE users SET referral_count = referral_count + 1 WHERE telegram_id = ?",
-                    (referrer_id,),
-                )
-                conn.commit()
-                logger.info(f"Реферер установлен для {user_id}, счетчик рефералов увеличен для {referrer_id}")
-                return True
-            logger.warning(f"Не удалось установить реферера для {user_id} (возможно, уже был установлен)")
-            return False
-        finally:
-            conn.close()
-    
-    success = await loop.run_in_executor(None, _set_referrer)
+    success = await set_referrer_for_user(user_id, referrer_id)
     if not success:
-        return  # Не удалось установить реферера (возможно, уже был установлен)
-    
+        logger.info("Пользователь %s уже имеет реферера или не найден, пропускаем начисление бонуса", user_id)
+        return
+    logger.info("Реферер установлен для user_id=%s, счетчик рефералов увеличен для referrer_id=%s", user_id, referrer_id)
+
     # Начисляем реферальный бонус
     logger.info(f"Начисление реферального бонуса для {referrer_id}")
     await process_referral_bonus(referrer_id, bot)
 
 
 async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
-    """Обрабатывает начисление реферального бонуса (3 дня) рефереру."""
-    logger.info(f"Начало обработки реферального бонуса для {referrer_id}")
+    """
+    Реферальный бонус: тип ключа пригласившего определяет логику.
+    - Legacy (.txt): только уведомление, подписку не продлеваем.
+    - API: при активной подписке — +3 дня в панели и в БД; при отсутствии — выдача ключа через API.
+    """
+    logger.info("process_referral_bonus: referrer_id=%s", referrer_id)
 
     referrer = await get_user_by_telegram_id(referrer_id)
     if not referrer:
-        logger.error(f"Реферер {referrer_id} не найден в БД при начислении бонуса")
+        logger.error("process_referral_bonus: referrer_id=%s, status=referrer_not_found", referrer_id)
         return
 
+    is_api_referrer = bool(referrer.get("is_api_user"))
     has_active = await has_active_subscription(referrer_id)
-    logger.info(f"Реферер {referrer_id}: has_active_subscription = {has_active}")
+    logger.info("process_referral_bonus: referrer_id=%s, key_type=%s, has_active=%s", referrer_id, "API" if is_api_referrer else "Legacy", has_active)
 
     if has_active:
-        # У реферера есть активная подписка — продлеваем на +3 дня, ключ не выдаём
-        extended = await extend_active_subscription_by_days(referrer_id, 3)
-        if not extended:
-            logger.error(f"Не удалось продлить подписку реферера {referrer_id}")
-            return
-        referrer_key = extended.get("payment_reference") or "—"
-        expires_at = extended.get("expires_at") or ""
-        if expires_at:
-            expires_display = expires_at.split("T")[0] if "T" in expires_at else expires_at[:10]
-        else:
-            expires_display = "—"
-        username = f"@{referrer.get('username')}" if referrer.get('username') else "нет username"
-        for admin_id in ADMIN_IDS:
+        if is_api_referrer:
+            # API-ключ: продлеваем в панели и в БД на 3 дня
+            uuid_str = referrer.get("v2ray_uuid")
+            if not uuid_str:
+                logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=no_uuid", referrer_id)
+                return
+            controller = get_xui()
+            if not await controller.ensure_logged_in():
+                logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=login_failed", referrer_id)
+                return
+            panel_ok = await controller.extend_client_expiry_by_days(uuid_str, 3)
+            if not panel_ok:
+                logger.warning("process_referral_bonus: referrer_id=%s, key_type=API, status=panel_extend_failed", referrer_id)
+            extended = await extend_active_subscription_by_days(referrer_id, 3)
+            if not extended:
+                logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=db_extend_failed", referrer_id)
+                return
+            logger.info("process_referral_bonus: referrer_id=%s, key_type=API, status=extended_3d, panel_ok=%s", referrer_id, panel_ok)
+            expires_at = extended.get("expires_at") or ""
+            expires_display = expires_at.split("T")[0] if expires_at and "T" in expires_at else (expires_at[:10] if expires_at else "—")
+            username = f"@{referrer.get('username')}" if referrer.get('username') else "нет username"
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            "🎁 <b>Реферальный бонус (+3 дня в профиль)</b>\n\n"
+                            f"👤 Кто пригласил: {referrer.get('first_name', '')} {username}\n"
+                            f"🆔 TG ID: <code>{referrer_id}</code> (API-ключ)\n"
+                            f"📅 Подписка продлена до: {expires_display}\n\n"
+                            "Подписка продлена в панели и в БД."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as e:
+                    logger.error("Не удалось отправить сообщение админу %s: %s", admin_id, e)
             try:
                 await bot.send_message(
-                    chat_id=admin_id,
+                    chat_id=referrer_id,
                     text=(
-                        "🎁 <b>Реферальный бонус (+3 дня в профиль)</b>\n\n"
-                        f"👤 Кто пригласил: {referrer.get('first_name', '')} {username}\n"
-                        f"🆔 TG ID: <code>{referrer_id}</code>\n"
-                        f"🔑 Его ключ: <code>{referrer_key}</code>\n"
-                        f"📅 Подписка продлена до: {expires_display}\n\n"
-                        "Ключ не выдавался — подписка продлена на 3 дня."
+                        "🎉 <b>Реферальный бонус!</b>\n\n"
+                        "Твой друг зарегистрировался по твоей ссылке.\n"
+                        "В твой профиль начислено <b>+3 дня</b> подписки.\n\n"
+                        "Ключ не меняется — проверь раздел «Профиль»."
                     ),
                     parse_mode=ParseMode.HTML,
                 )
             except Exception as e:
-                logger.error(f"Не удалось отправить сообщение админу {admin_id}: {e}")
-        # Уведомляем реферера, что в профиль добавлено +3 дня
-        try:
-            await bot.send_message(
-                chat_id=referrer_id,
-                text=(
-                    "🎉 <b>Реферальный бонус!</b>\n\n"
-                    "Твой друг зарегистрировался по твоей ссылке.\n"
-                    "В твой профиль начислено <b>+3 дня</b> подписки.\n\n"
-                    "Ключ не меняется — проверь раздел «Профиль»."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
+                logger.warning("Не удалось уведомить реферера %s: %s", referrer_id, e)
+        else:
+            # Legacy-ключ: только уведомление, подписку не продлеваем
+            logger.info("process_referral_bonus: referrer_id=%s, key_type=Legacy, status=notification_only", referrer_id)
+            try:
+                await bot.send_message(
+                    chat_id=referrer_id,
+                    text=(
+                        "🎉 <b>Реферальный бонус!</b>\n\n"
+                        "Твой друг зарегистрировался по твоей ссылке.\n"
+                        "Спасибо, что приглашаешь друзей!"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.warning("Не удалось уведомить реферера (Legacy) %s: %s", referrer_id, e)
         return
 
-    # Активной подписки нет — выдаём ключ (из файла или через API)
-    result = await issue_subscription_key(referrer_id, 3, KEYS_FILE_3D)
+    # Активной подписки нет — выдаём ключ только через API
+    result = await issue_subscription_key(referrer_id, 3, None)
     if not result:
-        logger.error(f"Не удалось выдать реферальный бонус пользователю {referrer_id}")
+        logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=issue_failed", referrer_id)
         return
 
-    key_or_link, is_api = result
-    key_label = "ссылка" if is_api else "ключ"
+    key_or_link, _ = result
     try:
         await bot.send_message(
             chat_id=referrer_id,
@@ -499,12 +498,12 @@ async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
                 "🎉 <b>Реферальный бонус!</b>\n\n"
                 "Твой друг зарегистрировался по твоей ссылке.\n"
                 "Тебе начислено <b>3 дня</b> подписки!\n\n"
-                f"🔑 Твой {key_label}:\n<code>{key_or_link}</code>"
+                f"🔑 Твоя ссылка для подключения:\n<code>{key_or_link}</code>"
             ),
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        logger.error(f"Не удалось отправить реферальный бонус рефереру {referrer_id}: {e}")
+        logger.error("process_referral_bonus: не удалось отправить ключ рефереру %s: %s", referrer_id, e)
         username = f"@{referrer.get('username')}" if referrer.get('username') else "нет username"
         for admin_id in ADMIN_IDS:
             try:
@@ -514,13 +513,13 @@ async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
                         "🎁 <b>Реферальный бонус (3 дня)</b>\n\n"
                         f"👤 Реферер: {referrer.get('first_name', '')} {username}\n"
                         f"🆔 TG ID: <code>{referrer_id}</code>\n"
-                        f"🔑 {key_label.capitalize()} для выдачи: <code>{key_or_link[:80]}...</code>\n\n"
+                        f"🔑 Ссылка: <code>{key_or_link[:80]}...</code>\n\n"
                         f"⚠️ Не удалось отправить сообщение рефереру. Ошибка: {e}"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
             except Exception as admin_error:
-                logger.error(f"Не удалось отправить реферальный бонус админу {admin_id}: {admin_error}")
+                logger.error("Не удалось отправить реферальный бонус админу %s: %s", admin_id, admin_error)
 
 
 async def cmd_help(message: Message) -> None:
@@ -1310,22 +1309,28 @@ async def cmd_revoke_subscription(message: Message, command: CommandObject) -> N
     ok = await revoke_active_subscription_for_telegram(telegram_id=telegram_id)
 
     if not ok:
+        logger.info("revoke: user_id=%s, status=no_active_subscription_or_user_not_found", telegram_id)
         await message.answer(
             "❌ Не найдено активной подписки для этого пользователя "
             "или пользователь отсутствует в базе."
         )
         return
 
-    # Если пользователь создан через API панели — удаляем клиента из панели
     user = await get_user_by_telegram_id(telegram_id)
+    key_type = "API" if (user and user.get("is_api_user")) else "Legacy"
+
     if user and user.get("is_api_user") and user.get("v2ray_uuid"):
         controller = get_xui()
         if await controller.ensure_logged_in():
             if await controller.delete_user(user["v2ray_uuid"]):
                 await clear_user_api_client(telegram_id)
-                logger.info("При /revoke удалён API-клиент tg_%s uuid=%s", telegram_id, user["v2ray_uuid"])
+                logger.info("revoke: user_id=%s, key_type=%s, status=success, panel=deleted, db=revoked", telegram_id, key_type)
             else:
-                logger.warning("При /revoke не удалось удалить клиента в панели uuid=%s", user["v2ray_uuid"])
+                logger.info("revoke: user_id=%s, key_type=%s, status=db_revoked_panel_failed, uuid=%s", telegram_id, key_type, user["v2ray_uuid"])
+        else:
+            logger.info("revoke: user_id=%s, key_type=%s, status=db_revoked_panel_login_failed", telegram_id, key_type)
+    else:
+        logger.info("revoke: user_id=%s, key_type=%s, status=success, panel=not_applicable, db=revoked", telegram_id, key_type)
 
     # Пытаемся уведомить пользователя
     try:

@@ -218,6 +218,36 @@ async def get_user_with_subscription(
     return user, sub
 
 
+async def set_referrer_for_user(user_telegram_id: int, referrer_telegram_id: int) -> bool:
+    """
+    Устанавливает referrer_id пользователю и увеличивает referral_count у реферера.
+    Возвращает True, если обновление выполнено (у пользователя ещё не было реферера).
+    """
+    loop = asyncio.get_running_loop()
+
+    def _op() -> bool:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET referrer_id = ? WHERE telegram_id = ? AND referrer_id IS NULL",
+                (referrer_telegram_id, user_telegram_id),
+            )
+            conn.commit()
+            if cur.rowcount == 0:
+                return False
+            cur.execute(
+                "UPDATE users SET referral_count = referral_count + 1 WHERE telegram_id = ?",
+                (referrer_telegram_id,),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    return await loop.run_in_executor(None, _op)
+
+
 async def create_pending_subscription(
     user_id: int,
     payment_reference: str,

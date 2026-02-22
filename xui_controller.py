@@ -104,17 +104,15 @@ class XUIController:
             async with session.post(url, data=payload) as resp:
                 if resp.status == 200:
                     body = await resp.text()
-                    # Успех: часто редирект или {"success": true}
                     if "success" in body.lower() or resp.status == 200:
-                        logger.info("XUI login successful")
+                        logger.info("XUI login: status=success")
                         return True
-                    # Некоторые панели возвращают 200 с ошибкой в теле
-                    logger.warning("XUI login response: %s", body[:200])
-                    return True  # Всё равно считаем успехом при 200
-                logger.warning("XUI login failed: status %s", resp.status)
+                    logger.warning("XUI login: status=unknown_response, body=%s", body[:200])
+                    return True
+                logger.info("XUI login: status=failed, http_status=%s", resp.status)
                 return False
         except Exception as e:
-            logger.exception("XUI login error: %s", e)
+            logger.exception("XUI login: status=error, error=%s", e)
             return False
 
     async def _get_client_uuid_by_email(self, email: str) -> Optional[str]:
@@ -226,6 +224,75 @@ class XUIController:
         logger.warning("XUI addClient: не удалось получить UUID по email %s, используем переданный", email)
         return client_uuid
 
+    async def _get_inbound_obj(self) -> Optional[dict]:
+        """Возвращает полный объект inbound из панели (для обновления срока клиента)."""
+        session = await self._get_session()
+        for url in (
+            urljoin(self.base_url, f"panel/api/inbounds/get/{self.inbound_id}"),
+            urljoin(self.base_url, "panel/api/inbounds/get") + f"?id={self.inbound_id}",
+        ):
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    if data and data.get("success") is not False:
+                        return data.get("obj") or data
+            except Exception:
+                continue
+        return None
+
+    async def extend_client_expiry_by_days(self, client_uuid: str, days: int) -> bool:
+        """
+        Продлевает срок действия клиента в панели на days дней.
+        Обновляет expiryTime у клиента с данным uuid и отправляет update в панель.
+        """
+        from datetime import datetime, timedelta
+
+        obj = await self._get_inbound_obj()
+        if not obj:
+            logger.warning("XUI extend_client_expiry: inbound not found")
+            return False
+        settings_raw = obj.get("settings")
+        if not settings_raw:
+            return False
+        settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+        clients = settings.get("clients") or []
+        found = None
+        for c in clients:
+            if c.get("id") == client_uuid:
+                found = c
+                break
+        if not found:
+            logger.warning("XUI extend_client_expiry: client uuid=%s not found", client_uuid)
+            return False
+        now_ms = int(datetime.utcnow().timestamp() * 1000)
+        current_expiry = found.get("expiryTime") or 0
+        if current_expiry <= 0:
+            new_expiry_ms = int((datetime.utcnow() + timedelta(days=days)).timestamp() * 1000)
+        else:
+            try:
+                current_dt = datetime.utcfromtimestamp(current_expiry / 1000.0)
+                new_expiry_ms = int((current_dt + timedelta(days=days)).timestamp() * 1000)
+            except Exception:
+                new_expiry_ms = int((datetime.utcnow() + timedelta(days=days)).timestamp() * 1000)
+        found["expiryTime"] = new_expiry_ms
+        settings_str = json.dumps(settings)
+        update_body = {"id": self.inbound_id, "settings": settings_str}
+        session = await self._get_session()
+        url = urljoin(self.base_url, "panel/api/inbounds/update/" + str(self.inbound_id))
+        try:
+            async with session.post(url, json=update_body) as resp:
+                text = await resp.text()
+                if resp.status == 200:
+                    logger.info("XUI extend_client_expiry: uuid=%s, days=%s, status=success", client_uuid, days)
+                    return True
+                logger.warning("XUI extend_client_expiry: status=failed, http=%s body=%s", resp.status, text[:200])
+                return False
+        except Exception as e:
+            logger.exception("XUI extend_client_expiry: status=error, error=%s", e)
+            return False
+
     async def delete_user(self, client_uuid: str) -> bool:
         """
         Удаляет клиента из inbound через /panel/api/inbounds/{id}/delClient/{uuid}
@@ -237,12 +304,12 @@ class XUIController:
             async with session.post(url) as resp:
                 text = await resp.text()
                 if resp.status == 200:
-                    logger.info("XUI delClient success for uuid=%s", client_uuid)
+                    logger.info("XUI delClient: uuid=%s, status=success", client_uuid)
                     return True
-                logger.warning("XUI delClient failed: status=%s body=%s", resp.status, text[:200])
+                logger.info("XUI delClient: uuid=%s, status=failed, http=%s body=%s", client_uuid, resp.status, text[:200])
                 return False
         except Exception as e:
-            logger.exception("XUI delete_user error: %s", e)
+            logger.exception("XUI delete_user: uuid=%s, status=error, error=%s", client_uuid, e)
             return False
 
     async def ensure_logged_in(self) -> bool:
