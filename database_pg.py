@@ -16,11 +16,13 @@ from sqlalchemy import (
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
+from urllib.parse import urlparse
 
 # DATABASE_URL от Render: postgres://... или postgresql://...
 # asyncpg ожидает postgresql+asyncpg://
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if DATABASE_URL:
+    orig = DATABASE_URL
     if DATABASE_URL.startswith("postgres://"):
         # Старый короткий префикс, используемый Heroku/Render
         DATABASE_URL = "postgresql+asyncpg://" + DATABASE_URL[11:]
@@ -30,6 +32,18 @@ if DATABASE_URL:
     elif not DATABASE_URL.startswith("postgresql+asyncpg://"):
         # На всякий случай — если протокол какой‑то другой, но совместимый
         DATABASE_URL = "postgresql+asyncpg://" + DATABASE_URL.split("://", 1)[-1]
+
+    # Логируем безопасную версию URL, чтобы видеть, что реально используется
+    try:
+        parsed = urlparse(DATABASE_URL)
+        safe_url = f"{parsed.scheme}://{parsed.username or ''}:***@{parsed.hostname or ''}"
+        if parsed.port:
+            safe_url += f":{parsed.port}"
+        if parsed.path:
+            safe_url += parsed.path
+        print(f"[DB] DATABASE_URL orig={orig!r} used={safe_url}")
+    except Exception as e:
+        print(f"[DB] failed to parse DATABASE_URL={DATABASE_URL!r}: {e}")
 
 # Для обратной совместиости (main.py может импортировать DB_PATH — не используется при PG)
 DB_PATH = Path(__file__).resolve().parent / "bot.db"
