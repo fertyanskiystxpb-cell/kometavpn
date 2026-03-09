@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import (
-    Column, DateTime, ForeignKey, Integer, String, Text,
+    Column, DateTime, ForeignKey, Integer, BigInteger, String, Text,
     select, update, delete, func,
 )
 from sqlalchemy.exc import IntegrityError
@@ -57,7 +57,7 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    telegram_id = Column(Integer, unique=True, nullable=False, index=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False, index=True)
     username = Column(String(255))
     first_name = Column(String(255))
     created_at = Column(DateTime(timezone=False), nullable=False, default=datetime.utcnow)
