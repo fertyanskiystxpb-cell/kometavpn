@@ -4,7 +4,7 @@ import os
 import sqlite3
 import datetime as dt
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -23,8 +23,6 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 load_dotenv()
-
-_pending_custom_days: Dict[int, None] = {}
 
 # PostgreSQL на Render: при наличии DATABASE_URL используем database_pg
 if os.getenv("DATABASE_URL"):
@@ -797,7 +795,6 @@ async def show_buy_info(message: Message) -> None:
         "📅 30 дней — 60 ₽\n"
         "💰 90 дней — 150 ₽\n"
         "👑 180 дней — 280 ₽\n"
-        "📆 Другое количество дней — по договорённости с администратором\n"
     )
 
     kb = InlineKeyboardMarkup(
@@ -806,7 +803,6 @@ async def show_buy_info(message: Message) -> None:
             [InlineKeyboardButton(text="📅 30 дней", callback_data="sub_30")],
             [InlineKeyboardButton(text="💰 90 дней", callback_data="sub_90")],
             [InlineKeyboardButton(text="👑 180 дней", callback_data="sub_180")],
-            [InlineKeyboardButton(text="📆 Другое количество дней", callback_data="sub_custom")],
         ]
     )
 
@@ -854,15 +850,6 @@ async def handle_subscription_duration_callback(callback: CallbackQuery) -> None
         logger.warning("Не удалось проверить подписку (callback): %s", e)
 
     data = callback.data or ""
-
-    # Пользователь выбрал произвольное количество дней
-    if data == "sub_custom":
-        _pending_custom_days[callback.from_user.id] = None
-        await callback.message.answer(
-            "✏️ Введите желаемое количество дней подписки (целое число, например 45)."
-        )
-        await callback.answer()
-        return
     # Пробный период обрабатываем отдельно
     if data == "sub_trial":
         # Проверяем, не использовал ли уже пробный период
@@ -1410,6 +1397,9 @@ async def cmd_grant_subscription(message: Message) -> None:
                 InlineKeyboardButton(text="180 дней", callback_data="grant_180"),
                 InlineKeyboardButton(text="∞ Бесконечность", callback_data="grant_inf"),
             ],
+            [
+                InlineKeyboardButton(text="📆 Другое количество дней", callback_data="grant_custom"),
+            ],
         ]
     )
     await message.answer(
@@ -1431,6 +1421,16 @@ async def handle_grant_callback(callback: CallbackQuery) -> None:
         return
     
     duration_key = data.replace("grant_", "")
+    if duration_key == "custom":
+        # Сохраняем состояние: ждём ввода количества дней от админа
+        if not hasattr(handle_grant_callback, "_pending"):
+            handle_grant_callback._pending = {}
+        handle_grant_callback._pending[callback.from_user.id] = ("await_days", None, None)
+        await callback.message.edit_text(
+            "✏️ Введите количество дней подписки (целое число, например 45)."
+        )
+        await callback.answer()
+        return
     duration_map = {
         "3": (3, KEYS_FILE_3D, "keys_3d.txt"),
         "7": (7, KEYS_FILE_7D, "keys_7d.txt"),
@@ -2167,47 +2167,6 @@ async def on_message_text(message: Message) -> None:
     if not await ensure_subscribed(message):
         return
 
-    # Обработка ввода произвольного количества дней после выбора «Другое количество дней»
-    user_id = message.from_user.id
-    if user_id in _pending_custom_days:
-        text_raw = (message.text or "").strip()
-        if not text_raw.isdigit():
-            await message.answer("❌ Введите количество дней цифрами, например 45.")
-            return
-
-        days = int(text_raw)
-        if days <= 0 or days > 365:
-            await message.answer("❌ Введите количество дней от 1 до 365.")
-            return
-
-        # Сбрасываем ожидание ввода
-        _pending_custom_days.pop(user_id, None)
-
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Получить",
-                        callback_data=f"pay_{days}",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Закрыть",
-                        callback_data="buy_close",
-                    )
-                ],
-            ]
-        )
-
-        await message.answer(
-            f"🛒 Вы запросили подписку на <b>{days}</b> дней.\n\n"
-            "💳 Стоимость уточните у администратора.\n"
-            "После оплаты нажмите кнопку «Получить» — заявка уйдёт администратору.",
-            reply_markup=kb,
-        )
-        return
-
     # Поддерживаем как варианты без эмодзи, так и с ними (на всякий случай)
     if message.text in ("Профиль", "👤 Профиль"):
         await show_profile(message)
@@ -2274,6 +2233,25 @@ async def main() -> None:
 
     async def admin_text_handler(message: Message) -> None:
         if is_admin(message.from_user.id) and message.text and message.text.strip().isdigit():
+            # Если для этого админа ожидаем ввод количества дней для /grant
+            pending_store = getattr(handle_grant_callback, "_pending", None)
+            if pending_store is not None:
+                pending = pending_store.get(message.from_user.id)
+                if pending and isinstance(pending, tuple) and pending[0] == "await_days":
+                    days = int(message.text.strip())
+                    if days <= 0 or days > 365:
+                        await message.answer("❌ Введите количество дней от 1 до 365.")
+                        return
+
+                    # Для API-выдачи keys_file не используется, поэтому передаём None и понятное имя
+                    pending_store[message.from_user.id] = (days, None, "панель API")
+                    days_text = f"{days} дней"
+                    await message.answer(
+                        f"📅 Выбрано: <b>{days_text}</b>\n\n"
+                        "Теперь отправьте Telegram ID пользователя одним сообщением (только число)."
+                    )
+                    return
+
             await handle_grant_user_id(message)
         else:
             await on_message_text(message)
