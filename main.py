@@ -128,9 +128,9 @@ ADMIN_IDS = {
 }
 
 # 3x-ui панель
-XUI_BASE_URL = os.getenv("XUI_BASE_URL", "https://151.241.215.71:49652/G9Z6TrOp6WywHYibcI/")
-XUI_USERNAME = os.getenv("XUI_USERNAME", "velolider")
-XUI_PASSWORD = os.getenv("XUI_PASSWORD", "KometavpnWWW")
+XUI_BASE_URL = os.getenv("XUI_BASE_URL", "https://193.109.69.12:10128/PX6MBzdePLyKyEOPRL/")
+XUI_USERNAME = os.getenv("XUI_USERNAME", "velocity")
+XUI_PASSWORD = os.getenv("XUI_PASSWORD", "UAD6ERUq")
 XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "1"))
 xui: Optional[XUIController] = None
 
@@ -219,8 +219,13 @@ async def ensure_subscribed(message: Message, pending_referrer_id: Optional[int]
         logger.info(f"Проверка подписки для {message.from_user.id}: статус = {member.status}")
     except Exception as e:
         # Если бот не может проверить (не админ в канале, приватный канал и т.п.) —
-        # не блокируем пользователя, НО реферал НЕ засчитываем (защита от накрутки).
+        # не блокируем пользователя. Реферал засчитываем, чтобы не терять бонусы.
         logger.warning(f"Не удалось проверить подписку на канал для {message.from_user.id}: {e}")
+        if pending_referrer_id:
+            logger.info(
+                f"Не удалось проверить подписку, но есть pending_referrer_id={pending_referrer_id}, начисляем бонус вслепую"
+            )
+            await process_referral_after_subscription(message.from_user.id, pending_referrer_id, message.bot)
         return True
 
     # Проверяем, что пользователь подписан (статус не "left" и не "kicked")
@@ -468,15 +473,30 @@ async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
             except Exception as e:
                 logger.warning("Не удалось уведомить реферера %s: %s", referrer_id, e)
         else:
-            # Legacy-ключ: только уведомление, подписку не продлеваем
-            logger.info("process_referral_bonus: referrer_id=%s, key_type=Legacy, status=notification_only", referrer_id)
+            # Legacy-ключ: продлеваем только в БД на 3 дня
+            extended = await extend_active_subscription_by_days(referrer_id, 3)
+            if not extended:
+                logger.error(
+                    "process_referral_bonus: referrer_id=%s, key_type=Legacy, status=db_extend_failed",
+                    referrer_id,
+                )
+                return
+            expires_at = extended.get("expires_at") or ""
+            expires_display = (
+                expires_at.split("T")[0] if expires_at and "T" in expires_at else (expires_at[:10] if expires_at else "—")
+            )
+            logger.info(
+                "process_referral_bonus: referrer_id=%s, key_type=Legacy, status=extended_3d", referrer_id
+            )
             try:
                 await bot.send_message(
                     chat_id=referrer_id,
                     text=(
                         "🎉 <b>Реферальный бонус!</b>\n\n"
                         "Твой друг зарегистрировался по твоей ссылке.\n"
-                        "Спасибо, что приглашаешь друзей!"
+                        "В твой профиль начислено <b>+3 дня</b> подписки.\n\n"
+                        f"📅 Новая дата окончания: <b>{expires_display}</b>\n\n"
+                        "Твой ключ не меняется — проверь раздел «Профиль»."
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -525,12 +545,57 @@ async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
 async def cmd_help(message: Message) -> None:
     if not await ensure_subscribed(message):
         return
+    
+    # Расширенный help для админа: все команды с примерами
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "📚 <b>Команды бота</b>\n\n"
+            "👥 <b>Для всех пользователей</b>\n"
+            "➡️ /start – главное меню\n"
+            "ℹ️ /help – список команд\n"
+            "👤 /profile – ваш профиль и статус подписки (там же кнопка «Заменить ключ»)\n"
+            "💳 /buy – купить подписку\n"
+            "🎁 /referral – ваша реферальная ссылка и правила\n\n"
+            "🛠 <b>Админ-команды</b>\n"
+            "📊 /admin – отчёт по пользователям в .txt\n\n"
+            "🎫 /grant – меню выдачи подписки по Telegram ID\n"
+            "   (выберите длительность и затем отправьте TELEGRAM_ID одним сообщением)\n\n"
+            "⛔ /revoke TELEGRAM_ID – отозвать активную подписку\n"
+            "   Пример: <code>/revoke 123456789</code>\n\n"
+            "👥 /referrals – статистика рефералов\n\n"
+            "🔁 /reset_trial TELEGRAM_ID – сбросить возможность взять пробный период\n"
+            "   Пример: <code>/reset_trial 123456789</code>\n\n"
+            "🧹 /reset_keys – меню сброса ключей\n"
+            "🧹 /reset_keys_count 30 [N] – сбросить N ключей из файла (30/90/180/trial)\n"
+            "   Пример: <code>/reset_keys_count 30 5</code>\n"
+            "🧹 /reset_key КЛЮЧ – сбросить один конкретный ключ\n"
+            "   Пример: <code>/reset_key abc123-ключ</code>\n\n"
+            "➕ /admin_add TELEGRAM_ID [username] [имя] – добавить/обновить пользователя в БД\n"
+            "   Пример: <code>/admin_add 123456789 nick Ivan</code>\n\n"
+            "🔑 /admin_setkey TELEGRAM_ID НОВЫЙ_КЛЮЧ – изменить ключ подписки\n"
+            "   Пример: <code>/admin_setkey 123456789 my-new-key-123</code>\n\n"
+            "✏️ /admin_setuser TELEGRAM_ID username|first_name ЗНАЧЕНИЕ – изменить ник/имя\n"
+            "   Примеры:\n"
+            "   <code>/admin_setuser 123456789 username newnick</code>\n"
+            "   <code>/admin_setuser 123456789 first_name Иван Иванов</code>\n\n"
+            "🗑 /delete_user TELEGRAM_ID – полностью удалить пользователя из БД\n"
+            "   Пример: <code>/delete_user 123456789</code>\n\n"
+            "📢 /broadcast Текст – рассылка всем пользователям\n"
+            "   Пример: <code>/broadcast Всем привет!</code>\n\n"
+            "✉️ /send TELEGRAM_ID Текст – сообщение одному пользователю\n"
+            "   Пример: <code>/send 123456789 Ваш ключ готов!</code>\n"
+        )
+        return
 
+    # Обычный help для пользователя
     await message.answer(
         "📚 <b>Команды бота</b>:\n"
         "➡️ /start – главное меню\n"
-        "👤 /profile – ваш профиль\n"
+        "ℹ️ /help – этот список\n"
+        "👤 /profile – ваш профиль и ключ\n"
         "💳 /buy – купить подписку\n"
+        "🎁 /referral – ваша реферальная ссылка\n"
+        "\nТакже вы можете пользоваться кнопками в главном меню."
     )
 
 
@@ -547,6 +612,7 @@ async def show_profile(message: Message) -> None:
         return
 
     user, sub = user_with_sub
+    show_replace_button = False
     if sub is None:
         sub_status = "Нет подписки"
         extra_lines: list[str] = []
@@ -576,6 +642,8 @@ async def show_profile(message: Message) -> None:
                     extra_lines.append(f"Ваша ссылка для подключения:\n<code>{display_key}</code>")
                 else:
                     extra_lines.append(f"Ваш ключ: {key}")
+                # Кнопка «Заменить ключ» доступна при любой активной подписке с ключом
+                show_replace_button = True
         elif sub_status == "expired":
             display_status = "Истекла"
             extra_lines.append("Срок действия подписки истек")
@@ -601,7 +669,113 @@ async def show_profile(message: Message) -> None:
         header = f"👤 <b>Ваш профиль</b>:\nИмя: {user.get('first_name')}\n"
 
     text = header + f"\n💼 Статус подписки: {display_status}{extra}"
-    await message.answer(text)
+    if show_replace_button:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔁 Заменить ключ",
+                        callback_data="replace_key",
+                    )
+                ],
+            ]
+        )
+        await message.answer(text, reply_markup=kb)
+    else:
+        await message.answer(text)
+
+
+async def handle_replace_key_callback(callback: CallbackQuery) -> None:
+    """
+    Заменяет текущий ключ пользователя на новый API-ключ, сохраняя оставшийся срок подписки.
+    Работает как для legacy-ключей, так и для уже выданных API-ключей.
+    """
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+
+    user_with_sub = await get_user_with_subscription(callback.from_user.id)
+    if not user_with_sub:
+        await callback.answer("Профиль не найден. Нажмите /start.", show_alert=True)
+        return
+
+    user, sub = user_with_sub
+    if not sub or sub.get("status") != "active":
+        await callback.answer("У вас нет активной подписки для замены ключа.", show_alert=True)
+        return
+
+    expires = sub.get("expires_at")
+    if not expires:
+        await callback.answer("Не удалось определить срок действия подписки.", show_alert=True)
+        return
+
+    # Считаем оставшееся количество дней, чтобы выдать новый ключ на тот же срок
+    try:
+        if "T" in expires:
+            expires_dt = dt.datetime.fromisoformat(expires)
+        else:
+            expires_dt = dt.datetime.strptime(expires[:10], "%Y-%m-%d")
+        now = dt.datetime.utcnow()
+        remaining_seconds = (expires_dt - now).total_seconds()
+        if remaining_seconds <= 0:
+            await callback.answer("Срок действия вашей подписки истёк. Ключ заменить нельзя.", show_alert=True)
+            return
+        remaining_days = max(1, int(remaining_seconds // 86400))
+    except Exception as e:
+        logger.error(
+            "replace_key: failed to parse expires_at for user_id=%s, expires=%s, error=%s",
+            callback.from_user.id,
+            expires,
+            e,
+        )
+        await callback.answer("Произошла ошибка при обработке срока действия подписки.", show_alert=True)
+        return
+
+    controller = get_xui()
+    if not await controller.ensure_logged_in():
+        logger.error("replace_key: login_failed user_id=%s", callback.from_user.id)
+        await callback.answer("Не удалось подключиться к VPN-серверу. Попробуйте позже.", show_alert=True)
+        return
+
+    # Если был старый API-ключ — удаляем клиента в панели и очищаем привязку
+    old_uuid = user.get("v2ray_uuid")
+    if user.get("is_api_user") and old_uuid:
+        deleted = await controller.delete_user(old_uuid)
+        if not deleted:
+            logger.warning("replace_key: delete_old_failed user_id=%s uuid=%s", callback.from_user.id, old_uuid)
+            await callback.answer(
+                "Не удалось удалить старый ключ. Попробуйте позже или обратитесь в поддержку.",
+                show_alert=True,
+            )
+            return
+        await clear_user_api_client(callback.from_user.id)
+
+    # Создаём нового клиента в панели на оставшийся срок
+    new_uuid = await controller.add_user(callback.from_user.id, remaining_days)
+    if not new_uuid:
+        logger.error("replace_key: add_user_failed user_id=%s", callback.from_user.id)
+        await callback.answer("Не удалось выдать новый ключ. Попробуйте позже.", show_alert=True)
+        return
+
+    # Обновляем ключ в последней подписке и помечаем пользователя как API-пользователя
+    updated = await update_user_subscription_key(telegram_id=callback.from_user.id, new_key=new_uuid)
+    if not updated:
+        logger.error("replace_key: update_user_subscription_key_failed user_id=%s", callback.from_user.id)
+        await callback.answer("Не удалось обновить ваш ключ в базе данных.", show_alert=True)
+        return
+
+    await set_user_api_client(callback.from_user.id, new_uuid)
+
+    key_or_link = generate_vless_link(new_uuid, f"Kometa-tg_{user.get('telegram_id', '')}")
+
+    await callback.message.answer(
+        "🔁 <b>Ключ заменён</b>\n\n"
+        "Старый ключ был удалён. Вот ваш новый ключ для подключения:\n"
+        f"<code>{key_or_link}</code>\n\n"
+        "Если VPN уже был настроен, просто замените старый ключ на этот.",
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer("Новый ключ выдан.")
 
 
 async def show_buy_info(message: Message) -> None:
@@ -777,7 +951,7 @@ async def handle_pay_callback(callback: CallbackQuery) -> None:
     user = callback.from_user
     username = f"@{user.username}" if user.username else "нет username"
 
-    # ===== Пробный период (1 день) — сразу выдаём ключ, без админа =====
+    # ===== Пробный период (1 день) =====
     if days == 1:
         if await has_used_trial(user.id):
             await callback.message.answer(
@@ -786,22 +960,61 @@ async def handle_pay_callback(callback: CallbackQuery) -> None:
             await callback.answer()
             return
 
-        result = await issue_subscription_key(user.id, 1, KEYS_FILE_TRIAL)
+        has_active = await has_active_subscription(user.id)
+
+        # Если подписка уже есть, просто добавляем 1 день к текущему сроку (без нового ключа)
+        if has_active:
+            db_user = await get_user_by_telegram_id(user.id)
+            is_api = bool(db_user and db_user.get("is_api_user") and db_user.get("v2ray_uuid"))
+
+            if is_api:
+                controller = get_xui()
+                if await controller.ensure_logged_in():
+                    panel_ok = await controller.extend_client_expiry_by_days(db_user["v2ray_uuid"], days)
+                    if not panel_ok:
+                        logger.warning(
+                            "trial_extend: user_id=%s, key_type=API, status=panel_extend_failed", user.id
+                        )
+
+            extended = await extend_active_subscription_by_days(user.id, days)
+            if not extended:
+                await callback.message.answer(
+                    "❌ Не удалось продлить вашу подписку на пробный день. Попробуйте позже."
+                )
+                await callback.answer()
+                return
+
+            await mark_trial_used(user.id)
+            expires_at = extended.get("expires_at") or ""
+            expires_date = (
+                expires_at.split("T")[0] if expires_at and "T" in expires_at else (expires_at[:10] if expires_at else "—")
+            )
+            text = (
+                "🆓 <b>Пробный период активирован</b>\n\n"
+                "У вас уже была подписка, поэтому к текущему сроку добавлен <b>+1 день</b>.\n\n"
+                f"📅 Новая дата окончания: <b>{expires_date}</b>\n\n"
+                "Ключ не меняется — проверьте раздел «Профиль»."
+            )
+            await callback.message.answer(text, parse_mode=ParseMode.HTML)
+            await callback.answer()
+            return
+
+        # Активной подписки нет — выдаём новый API-ключ на 1 день
+        result = await issue_subscription_key(user.id, 1, None)
         if not result:
             await callback.message.answer(
-                "❌ Не удалось оформить пробную подписку (нет ключей или ошибка API). Попробуйте позже или обратитесь к администратору."
+                "❌ Не удалось оформить пробную подписку (ошибка API). Попробуйте позже или обратитесь к администратору."
             )
             await callback.answer()
             return
 
-        key_or_link, is_api = result
+        key_or_link, _ = result
         await mark_trial_used(user.id)
         expires_date = (dt.datetime.utcnow() + dt.timedelta(days=days)).strftime("%Y-%m-%d")
-        key_label = "ссылка для подключения" if is_api else "ключ доступа (пробный)"
         text = (
             "🆓 Вам выдан <b>пробный период на 1 день</b>.\n\n"
             f"📅 Активен до: <b>{expires_date}</b>\n\n"
-            f"🔑 Ваш {key_label}:\n<code>{key_or_link}</code>\n\n"
+            f"🔑 Ваша ссылка для подключения:\n<code>{key_or_link}</code>\n\n"
             "📘 Инструкция по установке: https://telegra.ph/Kak-podklyuchit-VPN-za-1-minutu-02-13\n\n"
             "👤 Ключ также доступен в разделе «Профиль»."
         )
@@ -1955,7 +2168,7 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in environment variables.")
 
     await init_db()
-    
+
     # Запускаем фоновую задачу для проверки просроченных подписок
     asyncio.create_task(periodic_expiration_check())
 
@@ -1967,6 +2180,7 @@ async def main() -> None:
 
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_help, Command("help"))
+    dp.message.register(show_referral_system, Command("referral"))
     dp.message.register(show_profile, Command("profile"))
     dp.message.register(show_buy_info, Command("buy"))
     dp.message.register(cmd_admin_panel, Command("admin"))
@@ -1985,6 +2199,7 @@ async def main() -> None:
     dp.message.register(cmd_send_to_user, Command("send"))
 
     dp.callback_query.register(handle_subscription_duration_callback, F.data.startswith("sub_"))
+    dp.callback_query.register(handle_replace_key_callback, F.data == "replace_key")
     dp.callback_query.register(handle_pay_callback, F.data.startswith("pay_"))
     dp.callback_query.register(handle_buy_close_callback, F.data == "buy_close")
     dp.callback_query.register(handle_check_subscription_callback, F.data.startswith("check_subscription"))
