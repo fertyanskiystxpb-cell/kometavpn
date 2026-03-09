@@ -18,19 +18,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, relationship
 
 # DATABASE_URL от Render: postgres://... или postgresql://...
-# Приводим всё к async-формату postgresql+asyncpg://
+# asyncpg ожидает postgresql+asyncpg://
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 if DATABASE_URL:
-    raw = DATABASE_URL
-    # Старый формат Render: postgres://...
-    if raw.startswith("postgres://"):
-        DATABASE_URL = "postgresql+asyncpg://" + raw[11:]
-    # Обычный формат: postgresql://...
-    elif raw.startswith("postgresql://") and not raw.startswith("postgresql+asyncpg://"):
-        DATABASE_URL = "postgresql+asyncpg://" + raw.split("://", 1)[1]
-    # На всякий случай: если указали что-то без схемы
-    elif "://" not in raw:
-        DATABASE_URL = "postgresql+asyncpg://" + raw
+    if DATABASE_URL.startswith("postgres://"):
+        # Старый короткий префикс, используемый Heroku/Render
+        DATABASE_URL = "postgresql+asyncpg://" + DATABASE_URL[11:]
+    elif DATABASE_URL.startswith("postgresql://"):
+        # Полный sync‑драйвер, меняем на asyncpg
+        DATABASE_URL = "postgresql+asyncpg://" + DATABASE_URL[len("postgresql://") :]
+    elif not DATABASE_URL.startswith("postgresql+asyncpg://"):
+        # На всякий случай — если протокол какой‑то другой, но совместимый
+        DATABASE_URL = "postgresql+asyncpg://" + DATABASE_URL.split("://", 1)[-1]
 
 # Для обратной совместиости (main.py может импортировать DB_PATH — не используется при PG)
 DB_PATH = Path(__file__).resolve().parent / "bot.db"
