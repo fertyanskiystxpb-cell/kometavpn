@@ -4,7 +4,7 @@ import os
 import sqlite3
 import datetime as dt
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -23,6 +23,8 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 load_dotenv()
+
+_pending_custom_days: Dict[int, None] = {}
 
 # PostgreSQL на Render: при наличии DATABASE_URL используем database_pg
 if os.getenv("DATABASE_URL"):
@@ -608,13 +610,20 @@ async def show_profile(message: Message) -> None:
 
     user_with_sub = await get_user_with_subscription(message.from_user.id)
     if not user_with_sub:
-        await message.answer("⚠️ Вы ещё не зарегистрированы. Нажмите /start, чтобы начать.")
-        return
-
-    user, sub = user_with_sub
+        # Пользователь ещё не существует в БД (например, после миграции) — создаём без подписки
+        user = await get_or_create_user(
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            referrer_id=None,
+        )
+        sub = None
+    else:
+        user, sub = user_with_sub
     show_replace_button = False
     if sub is None:
         sub_status = "Нет подписки"
+        display_status = "Нет подписки"
         extra_lines: list[str] = []
     else:
         sub_status = sub.get("status", "unknown")
@@ -788,6 +797,7 @@ async def show_buy_info(message: Message) -> None:
         "📅 30 дней — 60 ₽\n"
         "💰 90 дней — 150 ₽\n"
         "👑 180 дней — 280 ₽\n"
+        "📆 Другое количество дней — по договорённости с администратором\n"
     )
 
     kb = InlineKeyboardMarkup(
@@ -796,6 +806,7 @@ async def show_buy_info(message: Message) -> None:
             [InlineKeyboardButton(text="📅 30 дней", callback_data="sub_30")],
             [InlineKeyboardButton(text="💰 90 дней", callback_data="sub_90")],
             [InlineKeyboardButton(text="👑 180 дней", callback_data="sub_180")],
+            [InlineKeyboardButton(text="📆 Другое количество дней", callback_data="sub_custom")],
         ]
     )
 
@@ -843,6 +854,15 @@ async def handle_subscription_duration_callback(callback: CallbackQuery) -> None
         logger.warning("Не удалось проверить подписку (callback): %s", e)
 
     data = callback.data or ""
+
+    # Пользователь выбрал произвольное количество дней
+    if data == "sub_custom":
+        _pending_custom_days[callback.from_user.id] = None
+        await callback.message.answer(
+            "✏️ Введите желаемое количество дней подписки (целое число, например 45)."
+        )
+        await callback.answer()
+        return
     # Пробный период обрабатываем отдельно
     if data == "sub_trial":
         # Проверяем, не использовал ли уже пробный период
@@ -2145,6 +2165,47 @@ async def show_support(message: Message) -> None:
 
 async def on_message_text(message: Message) -> None:
     if not await ensure_subscribed(message):
+        return
+
+    # Обработка ввода произвольного количества дней после выбора «Другое количество дней»
+    user_id = message.from_user.id
+    if user_id in _pending_custom_days:
+        text_raw = (message.text or "").strip()
+        if not text_raw.isdigit():
+            await message.answer("❌ Введите количество дней цифрами, например 45.")
+            return
+
+        days = int(text_raw)
+        if days <= 0 or days > 365:
+            await message.answer("❌ Введите количество дней от 1 до 365.")
+            return
+
+        # Сбрасываем ожидание ввода
+        _pending_custom_days.pop(user_id, None)
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Получить",
+                        callback_data=f"pay_{days}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Закрыть",
+                        callback_data="buy_close",
+                    )
+                ],
+            ]
+        )
+
+        await message.answer(
+            f"🛒 Вы запросили подписку на <b>{days}</b> дней.\n\n"
+            "💳 Стоимость уточните у администратора.\n"
+            "После оплаты нажмите кнопку «Получить» — заявка уйдёт администратору.",
+            reply_markup=kb,
+        )
         return
 
     # Поддерживаем как варианты без эмодзи, так и с ними (на всякий случай)
