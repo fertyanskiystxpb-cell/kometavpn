@@ -1,7 +1,4 @@
-"""
-Контроллер API панели 3x-ui для управления клиентами (VLESS/Reality).
-Использует aiohttp с сохранением сессии (куки) и передаёт settings как JSON-строку.
-"""
+
 
 import asyncio
 import json
@@ -15,27 +12,18 @@ from urllib.parse import urljoin
 import aiohttp
 
 logger = logging.getLogger(__name__)
-
-# Параметры Reality для генерации vless:// (как в панели)
-VLESS_ADDRESS = os.getenv("VLESS_ADDRESS", "151.241.215.71")
+VLESS_ADDRESS = os.getenv("VLESS_ADDRESS", "193.109.69.12")
 VLESS_PORT = int(os.getenv("VLESS_PORT", "443"))
 VLESS_SNI = os.getenv("VLESS_SNI", "swcdn.apple.com")
 VLESS_PBK = os.getenv("VLESS_PBK", "V6zkalrAPp-Hc6m6tSw4OMclfaxOJSdGMxNwVU3kOgA")
-# Short ID: в ссылке используется один короткий sid (первый до запятой, если несколько)
 VLESS_SID = os.getenv("VLESS_SID", "3db9a12c")
 VLESS_FLOW = os.getenv("VLESS_FLOW", "xtls-rprx-vision")
 VLESS_SECURITY = os.getenv("VLESS_SECURITY", "reality")
-VLESS_FP = os.getenv("VLESS_FP", "chrome")  # fingerprint
-VLESS_SPX = os.getenv("VLESS_SPX", "%2F")   # spx (path), уже закодировано или /
+VLESS_FP = os.getenv("VLESS_FP", "chrome") 
+VLESS_SPX = os.getenv("VLESS_SPX", "%2F") 
 
 
 def generate_vless_link(uuid: str, remark: Optional[str] = None) -> str:
-    """
-    Собирает vless:// как в панели 3x-ui (Reality).
-    Порядок и набор параметров должны совпадать с панелью.
-    remark: комментарий после # (например Kometa-tg_8516740130).
-    """
-    # Один короткий sid для ссылки (панель использует один)
     sid = VLESS_SID.split(",")[0].strip() if VLESS_SID else ""
     params = [
         "type=tcp",
@@ -54,11 +42,6 @@ def generate_vless_link(uuid: str, remark: Optional[str] = None) -> str:
 
 
 class XUIController:
-    """
-    Управление панелью 3x-ui: авторизация, добавление/удаление клиентов.
-    Сессия aiohttp сохраняет куки между запросами.
-    """
-
     def __init__(
         self,
         base_url: str,
@@ -91,9 +74,6 @@ class XUIController:
             self._session = None
 
     async def login(self) -> bool:
-        """
-        Авторизация в панели. Куки сохраняются в сессии.
-        """
         session = await self._get_session()
         url = urljoin(self.base_url, "login")
         payload = {
@@ -116,12 +96,7 @@ class XUIController:
             return False
 
     async def _get_client_uuid_by_email(self, email: str) -> Optional[str]:
-        """
-        Получает inbound из панели и находит UUID клиента по email.
-        Панель может создавать своего UUID при addClient, поэтому реальный UUID берём отсюда.
-        """
         session = await self._get_session()
-        # Варианты: GET .../get/1 или GET .../get?id=1
         urls_to_try = [
             urljoin(self.base_url, f"panel/api/inbounds/get/{self.inbound_id}"),
             urljoin(self.base_url, "panel/api/inbounds/get") + f"?id={self.inbound_id}",
@@ -163,18 +138,13 @@ class XUIController:
         duration_days: int,
         client_uuid: Optional[str] = None,
     ) -> Optional[str]:
-        """
-        Создаёт клиента во inbound. Email = tg_{telegram_id}.
-        expiryTime в миллисекундах Unix.
-        Возвращает реальный UUID клиента из панели (после создания запрашиваем get и берём id по email).
-        """
         from datetime import datetime, timedelta
 
         if client_uuid is None:
             client_uuid = str(uuid_lib.uuid4())
 
         if duration_days <= 0:
-            expiry_time_ms = 0  # без срока в 3x-ui
+            expiry_time_ms = 0 
         else:
             expire_dt = datetime.utcnow() + timedelta(days=duration_days)
             expiry_time_ms = int(expire_dt.timestamp() * 1000)
@@ -215,8 +185,7 @@ class XUIController:
             logger.exception("XUI add_user error: %s", e)
             return None
 
-        # Панель может присвоить клиенту свой UUID — получаем реальный из панели
-        await asyncio.sleep(0.5)  # даём панели обновиться
+        await asyncio.sleep(0.5)  
         real_uuid = await self._get_client_uuid_by_email(email)
         if real_uuid:
             logger.info("XUI addClient success for tg_%s, real uuid=%s", telegram_id, real_uuid)
@@ -243,10 +212,6 @@ class XUIController:
         return None
 
     async def extend_client_expiry_by_days(self, client_uuid: str, days: int) -> bool:
-        """
-        Продлевает срок действия клиента в панели на days дней.
-        Обновляет expiryTime у клиента с данным uuid и отправляет update в панель.
-        """
         from datetime import datetime, timedelta
 
         obj = await self._get_inbound_obj()
@@ -294,9 +259,6 @@ class XUIController:
             return False
 
     async def delete_user(self, client_uuid: str) -> bool:
-        """
-        Удаляет клиента из inbound через /panel/api/inbounds/{id}/delClient/{uuid}
-        """
         session = await self._get_session()
         path = f"panel/api/inbounds/{self.inbound_id}/delClient/{client_uuid}"
         url = urljoin(self.base_url, path)
@@ -313,5 +275,4 @@ class XUIController:
             return False
 
     async def ensure_logged_in(self) -> bool:
-        """Вызывает login() при необходимости (можно расширить проверку куки)."""
         return await self.login()
