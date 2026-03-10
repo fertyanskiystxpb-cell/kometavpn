@@ -128,9 +128,9 @@ ADMIN_IDS = {
 }
 
 # 3x-ui панель
-XUI_BASE_URL = os.getenv("XUI_BASE_URL", "https://193.109.69.12:10128/PX6MBzdePLyKyEOPRL/")
-XUI_USERNAME = os.getenv("XUI_USERNAME", "velocity")
-XUI_PASSWORD = os.getenv("XUI_PASSWORD", "UAD6ERUq")
+XUI_BASE_URL = os.getenv("XUI_BASE_URL", "https://193.109.69.12:2053/CtrJdwqTSwytSmlar1/")
+XUI_USERNAME = os.getenv("XUI_USERNAME", "0SL0Yi6N66")
+XUI_PASSWORD = os.getenv("XUI_PASSWORD", "WMpP9Mvjyg")
 XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "1"))
 xui: Optional[XUIController] = None
 
