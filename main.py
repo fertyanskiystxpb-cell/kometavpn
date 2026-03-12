@@ -131,8 +131,8 @@ ADMIN_IDS = {
 XUI_BASE_URL = os.getenv("XUI_BASE_URL", "https://193.109.69.12:2053/CtrJdwqTSwytSmlar1/")
 XUI_USERNAME = os.getenv("XUI_USERNAME", "0SL0Yi6N66")
 XUI_PASSWORD = os.getenv("XUI_PASSWORD", "WMpP9Mvjyg")
-XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "1"))
-xui: Optional[XUIController] = None
+XUI_INBOUND_ID = int(os.getenv("XUI_INBOUND_ID", "4"))
+xui: Optional[XUIController] = Noneу
 
 
 def get_xui() -> XUIController:
