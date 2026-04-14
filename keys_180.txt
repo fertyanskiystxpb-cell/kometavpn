@@ -1,3 +1,0 @@
-vless://f807821e-2993-4426-a0cf-4ae117ea0e02@151.241.215.71:443?type=tcp&encryption=none&security=reality&pbk=V6zkalrAPp-Hc6m6tSw4OMclfaxOJSdGMxNwVU3kOgA&fp=chrome&sni=www.intel.com&sid=3db9a12c&spx=%2F#Kometa-VPN(id23)
-vless://68f5eaf0-8fd1-46e4-b982-807d089308b5@151.241.215.71:443?type=tcp&encryption=none&security=reality&pbk=V6zkalrAPp-Hc6m6tSw4OMclfaxOJSdGMxNwVU3kOgA&fp=chrome&sni=swcdn.apple.com&sid=3db9a12c&spx=%2F#Kometa-VPN(id02)
-vless://d247c6a6-a66c-4f9f-9e63-2aca2582be6a@151.241.215.71:443?type=tcp&encryption=none&security=reality&pbk=V6zkalrAPp-Hc6m6tSw4OMclfaxOJSdGMxNwVU3kOgA&fp=chrome&sni=swcdn.apple.com&sid=3db9a12c&spx=%2F#Kometa-VPN(id39)
