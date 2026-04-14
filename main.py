@@ -631,16 +631,41 @@ async def show_profile(message: Message) -> None:
         
         # Форматируем статус подписки для отображения
         if sub_status == "active":
-            display_status = "Активна"
             if expires:
-                # Форматируем дату в ГГГГ-ММ-ДД
+                # Проверяем, действительно ли подписка еще активна
                 try:
-                    # Пробуем распарсить ISO формат и взять только дату
-                    expires_date = expires.split('T')[0] if 'T' in expires else expires[:10]
-                    extra_lines.append(f"Истекает: {expires_date}")
+                    from datetime import datetime
+                    # Пробуем распарсить ISO формат
+                    if 'T' in expires:
+                        expires_date = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+                    else:
+                        # Если только дата, добавляем время
+                        expires_date = datetime.fromisoformat(expires + 'T23:59:59')
+                    
+                    now = datetime.utcnow()
+                    if expires_date > now:
+                        display_status = "Активна"
+                        days_left = (expires_date - now).days
+                        if days_left == 0:
+                            extra_lines.append(f"Истекает сегодня")
+                        elif days_left == 1:
+                            extra_lines.append(f"Истекает завтра")
+                        else:
+                            extra_lines.append(f"Истекает: {expires_date.strftime('%Y-%m-%d')} ({days_left} дней)")
+                    else:
+                        # Подписка фактически истекла, но статус еще не обновлен
+                        display_status = "Истекла"
+                        extra_lines.append("Срок действия подписки истек")
                 except:
-                    extra_lines.append(f"Истекает: {expires}")
-            if key:
+                    # Если не удалось распарсить дату, показываем как есть
+                    display_status = "Активна"
+                    extra_lines.append(f"Истекает: {expires.split('T')[0] if 'T' in expires else expires[:10]}")
+            else:
+                display_status = "Активна"
+                extra_lines.append("Без ограничения срока")
+            
+            # Показываем ключ только если подписка действительно активна
+            if display_status == "Активна" and key:
                 if user.get("is_api_user") and user.get("v2ray_uuid"):
                     display_key = generate_vless_link(
                         user["v2ray_uuid"],
@@ -712,31 +737,34 @@ async def handle_replace_key_callback(callback: CallbackQuery) -> None:
         return
 
     expires = sub.get("expires_at")
-    if not expires:
-        await callback.answer("Не удалось определить срок действия подписки.", show_alert=True)
-        return
-
-    # Считаем оставшееся количество дней, чтобы выдать новый ключ на тот же срок
-    try:
-        if "T" in expires:
-            expires_dt = dt.datetime.fromisoformat(expires)
-        else:
-            expires_dt = dt.datetime.strptime(expires[:10], "%Y-%m-%d")
-        now = dt.datetime.utcnow()
-        remaining_seconds = (expires_dt - now).total_seconds()
-        if remaining_seconds <= 0:
-            await callback.answer("Срок действия вашей подписки истёк. Ключ заменить нельзя.", show_alert=True)
+    remaining_days = None
+    
+    # Обрабатываем разные типы подписок
+    if expires is None:
+        # Бесконечная подписка
+        remaining_days = 0  # 0 означает бесконечность для add_user
+    else:
+        # Подписка с ограниченным сроком
+        try:
+            if "T" in expires:
+                expires_dt = dt.datetime.fromisoformat(expires)
+            else:
+                expires_dt = dt.datetime.strptime(expires[:10], "%Y-%m-%d")
+            now = dt.datetime.utcnow()
+            remaining_seconds = (expires_dt - now).total_seconds()
+            if remaining_seconds <= 0:
+                await callback.answer("Срок действия вашей подписки истёк. Ключ заменить нельзя.", show_alert=True)
+                return
+            remaining_days = max(1, int(remaining_seconds // 86400))
+        except Exception as e:
+            logger.error(
+                "replace_key: failed to parse expires_at for user_id=%s, expires=%s, error=%s",
+                callback.from_user.id,
+                expires,
+                e,
+            )
+            await callback.answer("Произошла ошибка при обработке срока действия подписки.", show_alert=True)
             return
-        remaining_days = max(1, int(remaining_seconds // 86400))
-    except Exception as e:
-        logger.error(
-            "replace_key: failed to parse expires_at for user_id=%s, expires=%s, error=%s",
-            callback.from_user.id,
-            expires,
-            e,
-        )
-        await callback.answer("Произошла ошибка при обработке срока действия подписки.", show_alert=True)
-        return
 
     controller = get_xui()
     if not await controller.ensure_logged_in():
@@ -775,9 +803,16 @@ async def handle_replace_key_callback(callback: CallbackQuery) -> None:
 
     key_or_link = generate_vless_link(new_uuid, f"Kometa-tg_{user.get('telegram_id', '')}")
 
+    # Формируем сообщение в зависимости от типа подписки
+    if remaining_days == 0:
+        subscription_info = "Ваша бессрочная подписка сохранена."
+    else:
+        subscription_info = f"Срок действия подписки: {remaining_days} дней."
+
     await callback.message.answer(
-        "🔁 <b>Ключ заменён</b>\n\n"
-        "Старый ключ был удалён. Вот ваш новый ключ для подключения:\n"
+        f"🔁 <b>Ключ заменён</b>\n\n"
+        f"Старый ключ был удалён. {subscription_info}\n\n"
+        f"Ваш новый ключ для подключения:\n"
         f"<code>{key_or_link}</code>\n\n"
         "Если VPN уже был настроен, просто замените старый ключ на этот.",
         parse_mode=ParseMode.HTML,

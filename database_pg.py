@@ -357,8 +357,15 @@ async def extend_active_subscription_by_days(telegram_id: int, days: int) -> Opt
         if not sub:
             return None
         if sub.expires_at:
-            sub.expires_at = sub.expires_at + timedelta(days=days)
+            # Check if current subscription is still active
+            if sub.expires_at > now:
+                # Subscription is still active, extend from current expiry date
+                sub.expires_at = sub.expires_at + timedelta(days=days)
+            else:
+                # Subscription is expired, extend from current time
+                sub.expires_at = now + timedelta(days=days)
         else:
+            # No expiry date, set from current time
             sub.expires_at = now + timedelta(days=days)
         await session.commit()
         await session.refresh(sub)

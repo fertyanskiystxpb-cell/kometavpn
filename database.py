@@ -510,9 +510,13 @@ async def extend_active_subscription_by_days(
                     part = expires_at.split("T")[0] if "T" in expires_at else expires_at[:10]
                     y, m, d = map(int, part.split("-"))
                     current_end = dt.datetime(y, m, d)
-                    if current_end < now:
-                        current_end = now
-                    new_expires = (current_end + dt.timedelta(days=days)).isoformat()
+                    if current_end > now:
+                        # Subscription is still active, extend from current expiry date
+                        base_date = current_end
+                    else:
+                        # Subscription is expired, extend from current time
+                        base_date = now
+                    new_expires = (base_date + dt.timedelta(days=days)).isoformat()
                 except (ValueError, TypeError):
                     new_expires = (now + dt.timedelta(days=days)).isoformat()
             else:
