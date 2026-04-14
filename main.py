@@ -9,15 +9,15 @@ from typing import Optional, Tuple
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
     BufferedInputFile,
+    LinkPreviewOptions,
 )
 
 from dotenv import load_dotenv
@@ -152,20 +152,51 @@ async def issue_subscription_key(
     telegram_id: int,
     duration_days: int,
     keys_file: Optional[Path] = None,
-) -> Optional[Tuple[str, bool]]:
+) -> Optional[Tuple[str, bool, Optional[str]]]:
     """
     Выдаёт подписку только через API панели (выдача из .txt отключена).
     Legacy-пользователи с уже выданными ключами из файлов не затрагиваются.
-    Возвращает (vless_ссылка, True) или None при ошибке.
+    Возвращает (vless_ссылка, is_api, expires_at_iso) или None при ошибке.
     """
+    user = await get_user_by_telegram_id(telegram_id)
+    has_active = await has_active_subscription(telegram_id)
+
+    # Если подписка активна и пользователь API — продлеваем текущий срок
+    if has_active and user and user.get("is_api_user") and user.get("v2ray_uuid"):
+        uuid_str = user["v2ray_uuid"]
+        controller = get_xui()
+        if not await controller.ensure_logged_in():
+            logger.error("issue_subscription_key: user_id=%s, key_type=API, status=login_failed_extend", telegram_id)
+            return None
+        panel_ok = await controller.extend_client_expiry_by_days(uuid_str, duration_days)
+        if not panel_ok:
+            logger.error("issue_subscription_key: user_id=%s, key_type=API, status=panel_extend_failed", telegram_id)
+            return None
+
+        extended = await extend_active_subscription_by_days(telegram_id, duration_days)
+        if not extended:
+            logger.error("issue_subscription_key: user_id=%s, key_type=API, status=db_extend_failed", telegram_id)
+            return None
+
+        expires_at = extended.get("expires_at")
+        logger.info(
+            "issue_subscription_key: user_id=%s, key_type=API, status=extended, uuid=%s",
+            telegram_id,
+            uuid_str,
+        )
+        return (generate_vless_link(uuid_str, f"Kometa-tg_{telegram_id}"), True, expires_at)
+
+    # Новая подписка (или истёкшая) — создаём клиента и новую запись
     controller = get_xui()
     if not await controller.ensure_logged_in():
         logger.error("issue_subscription_key: user_id=%s, key_type=API, status=login_failed", telegram_id)
         return None
+
     uuid_str = await controller.add_user(telegram_id, duration_days)
     if not uuid_str:
         logger.error("issue_subscription_key: user_id=%s, key_type=API, status=addClient_failed", telegram_id)
         return None
+
     ok = await create_active_subscription_with_key(
         telegram_id=telegram_id,
         duration_days=duration_days,
@@ -174,9 +205,11 @@ async def issue_subscription_key(
     if not ok:
         logger.error("issue_subscription_key: user_id=%s, key_type=API, status=db_create_failed", telegram_id)
         return None
+
     await set_user_api_client(telegram_id, uuid_str)
+    expires_at = None if duration_days <= 0 else (dt.datetime.utcnow() + dt.timedelta(days=duration_days)).isoformat()
     logger.info("issue_subscription_key: user_id=%s, key_type=API, status=success, uuid=%s", telegram_id, uuid_str)
-    return (generate_vless_link(uuid_str, f"Kometa-tg_{telegram_id}"), True)
+    return (generate_vless_link(uuid_str, f"Kometa-tg_{telegram_id}"), True, expires_at)
 
 
 logging.basicConfig(
@@ -184,18 +217,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Профиль")],
-            [KeyboardButton(text="Купить подписку")],
-            [KeyboardButton(text="Реферальная система")],
-            [KeyboardButton(text="Поддержка")],
-        ],
-        resize_keyboard=True,
-    )
 
 
 async def ensure_subscribed(message: Message, pending_referrer_id: Optional[int] = None) -> bool:
@@ -343,7 +364,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     
     if not subscription_ok:
         return
-
+    
     # Получаем username бота для реферальной ссылки
     try:
         bot_info = await message.bot.get_me()
@@ -357,6 +378,10 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
         "⚡ Быстрый и дешёвый VPN-сервис!\n\n"
         "📄 Пользовательское соглашение: https://telegra.ph/Polzovatelskoe-soglashenie-02-12-23\n\n"
         f"📢 Чтобы пользоваться ботом, убедитесь, что вы подписаны на канал: {REQUIRED_CHANNEL}\n\n"
+        "🚀 <b>Как начать?</b>\n"
+        "1️⃣ Нажмите кнопку «Купить подписку» ниже\n"
+        "2️⃣ Выберите пробный период (3 дня) или платный тариф\n"
+        "3️⃣ Получите ключ и настройте VPN\n\n"
         f"🎁 <b>Реферальная система</b>\n"
         f"Пригласи друга и получи <b>3 дня</b> подписки!\n"
         f"Твоя ссылка: <code>{referral_link}</code>"
@@ -365,10 +390,27 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
     if is_new_user and referrer_id:
         text += "\n\n✅ Ты зарегистрировался по реферальной ссылке!"
     
-    # Добавляем информацию о реферальной системе в приветствие
-    text += "\n\n💡 Используй кнопку «Реферальная система» в меню для получения своей реферальной ссылки!"
     
-    await message.answer(text, reply_markup=main_menu_keyboard())
+    # Use inline keyboard for navigation
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📋 Профиль", callback_data="profile"),
+                InlineKeyboardButton(text="💳 Купить подписку", callback_data="buy"),
+            ],
+            [
+                InlineKeyboardButton(text="🤝 Реферальная система", callback_data="referral"),
+                InlineKeyboardButton(text="📞 Поддержка", callback_data="support"),
+            ],
+        ]
+    )
+    
+    await message.answer(
+        text, 
+        reply_markup=keyboard, 
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True)
+    )
 
 
 async def process_referral_after_subscription(user_id: int, referrer_id: int, bot: Bot) -> None:
@@ -504,13 +546,42 @@ async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
                 logger.warning("Не удалось уведомить реферера (Legacy) %s: %s", referrer_id, e)
         return
 
-    # Активной подписки нет — выдаём ключ только через API
-    result = await issue_subscription_key(referrer_id, 3, None)
-    if not result:
-        logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=issue_failed", referrer_id)
+    # Активной подписки нет — проверяем, есть ли клиент в 3x-ui
+    controller = get_xui()
+    if not await controller.ensure_logged_in():
+        logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=login_failed", referrer_id)
         return
-
-    key_or_link, _ = result
+    
+    # Проверяем, есть ли уже клиент в 3x-ui
+    existing_uuid = await controller._get_client_uuid_by_email(f"tg_{referrer_id}")
+    
+    if existing_uuid:
+        # Клиент существует - продлеваем его
+        logger.info("process_referral_bonus: referrer_id=%s, found_existing_client=%s", referrer_id, existing_uuid)
+        panel_ok = await controller.extend_client_expiry_by_days(existing_uuid, 3)
+        if not panel_ok:
+            logger.warning("process_referral_bonus: referrer_id=%s, key_type=API, status=panel_extend_failed", referrer_id)
+        
+        # Создаем/обновляем подписку в БД
+        extended = await extend_active_subscription_by_days(referrer_id, 3)
+        if not extended:
+            logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=db_extend_failed", referrer_id)
+            return
+        
+        # Обновляем связь с API клиентом
+        await set_user_api_client(referrer_id, existing_uuid)
+        
+        key_or_link = generate_vless_link(existing_uuid, f"Kometa-tg_{referrer_id}")
+        logger.info("process_referral_bonus: referrer_id=%s, key_type=API, status=extended_existing_3d", referrer_id)
+    else:
+        # Клиента нет - создаем нового
+        logger.info("process_referral_bonus: referrer_id=%s, no_existing_client", referrer_id)
+        result = await issue_subscription_key(referrer_id, 3, None)
+        if not result:
+            logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=issue_failed", referrer_id)
+            return
+        key_or_link, _, _ = result
+        logger.info("process_referral_bonus: referrer_id=%s, key_type=API, status=created_new_3d", referrer_id)
     try:
         await bot.send_message(
             chat_id=referrer_id,
@@ -701,20 +772,19 @@ async def show_profile(message: Message) -> None:
         header = f"👤 <b>Ваш профиль</b>:\nИмя: {user.get('first_name')}\n"
 
     text = header + f"\n💼 Статус подписки: {display_status}{extra}"
+    rows = []
     if show_replace_button:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🔁 Заменить ключ",
-                        callback_data="replace_key",
-                    )
-                ],
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔁 Заменить ключ",
+                    callback_data="replace_key",
+                )
             ]
         )
-        await message.answer(text, reply_markup=kb)
-    else:
-        await message.answer(text)
+    rows.append([InlineKeyboardButton(text="⬅️ В главное меню", callback_data="main_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    await message.answer(text, reply_markup=kb)
 
 
 async def handle_replace_key_callback(callback: CallbackQuery) -> None:
@@ -826,18 +896,19 @@ async def show_buy_info(message: Message) -> None:
 
     text = (
         "💳 <b>Выберите длительность подписки</b>:\n\n"
-        "🆓 Пробный период (1 день) — бесплатно, можно получить только один раз\n"
-        "📅 30 дней — 60 ₽\n"
-        "💰 90 дней — 150 ₽\n"
-        "👑 180 дней — 280 ₽\n"
+        "🆓 Пробный период (3 дня) — бесплатно, можно получить только один раз\n"
+        "📅 30 дней — 80 ₽\n"
+        "💰 90 дней — 200 ₽\n"
+        "👑 180 дней — 350 ₽\n"
     )
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🆓 Пробный период (1 день)", callback_data="sub_trial")],
+            [InlineKeyboardButton(text="🆓 Пробный период (3 дня)", callback_data="sub_trial")],
             [InlineKeyboardButton(text="📅 30 дней", callback_data="sub_30")],
             [InlineKeyboardButton(text="💰 90 дней", callback_data="sub_90")],
-            [InlineKeyboardButton(text="👑 180 дней", callback_data="sub_180")],
+            [InlineKeyboardButton(text="👑 180 дней (6 мес.)", callback_data="sub_180")],
+            [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="main_menu")],
         ]
     )
 
@@ -895,7 +966,7 @@ async def handle_subscription_duration_callback(callback: CallbackQuery) -> None
             await callback.answer()
             return
 
-        days = 1
+        days = 3
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -906,15 +977,15 @@ async def handle_subscription_duration_callback(callback: CallbackQuery) -> None
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Закрыть",
-                        callback_data="buy_close",
+                        text="⬅️ Назад",
+                        callback_data="buy",
                     )
                 ],
             ]
         )
 
         text = (
-            "🆓 Вы выбрали пробный период на 1 день.\n\n"
+            "🆓 Вы выбрали пробный период на 3 дня.\n\n"
             "ℹ️ Пробный период выдается бесплатно и только один раз.\n"
             "👇 Нажмите «Получить пробный период», чтобы получить ключ.\n"
         )
@@ -941,8 +1012,8 @@ async def handle_subscription_duration_callback(callback: CallbackQuery) -> None
                 ],
                 [
                     InlineKeyboardButton(
-                        text="Закрыть",
-                        callback_data="buy_close",
+                        text="⬅️ Назад",
+                        callback_data="buy",
                     )
                 ],
             ]
@@ -950,11 +1021,11 @@ async def handle_subscription_duration_callback(callback: CallbackQuery) -> None
 
         # Определяем цену в зависимости от выбранной длительности
         if days == 30:
-            price = 60
+            price = 80
         elif days == 90:
-            price = 150
+            price = 200
         elif days == 180:
-            price = 280
+            price = 350
         else:
             price = 0  # защита от некорректных значений
 
@@ -962,6 +1033,8 @@ async def handle_subscription_duration_callback(callback: CallbackQuery) -> None
             f"🛒 Вы выбрали подписку на <b>{days}</b> дней.\n\n"
             f"💳 Для покупки VPN отправьте <b>{price} ₽</b> на данные реквизиты:\n\n"
             "💳 2200 7021 0425 4771\n\n"
+            "Или\n\n"
+            "💳 +79778420372 (Т-банк)\n\n"
             "✅ После оплаты нажмите на кнопку «Получить».\n"
         )
 
@@ -993,8 +1066,8 @@ async def handle_pay_callback(callback: CallbackQuery) -> None:
     user = callback.from_user
     username = f"@{user.username}" if user.username else "нет username"
 
-    # ===== Пробный период (1 день) =====
-    if days == 1:
+    # ===== Пробный период (3 дня) =====
+    if days == 3:
         if await has_used_trial(user.id):
             await callback.message.answer(
                 "⚠️ Вы уже использовали пробный период. Выберите платную подписку."
@@ -1004,7 +1077,7 @@ async def handle_pay_callback(callback: CallbackQuery) -> None:
 
         has_active = await has_active_subscription(user.id)
 
-        # Если подписка уже есть, просто добавляем 1 день к текущему сроку (без нового ключа)
+        # Если подписка уже есть, просто добавляем 3 дня к текущему сроку (без нового ключа)
         if has_active:
             db_user = await get_user_by_telegram_id(user.id)
             is_api = bool(db_user and db_user.get("is_api_user") and db_user.get("v2ray_uuid"))
@@ -1033,7 +1106,7 @@ async def handle_pay_callback(callback: CallbackQuery) -> None:
             )
             text = (
                 "🆓 <b>Пробный период активирован</b>\n\n"
-                "У вас уже была подписка, поэтому к текущему сроку добавлен <b>+1 день</b>.\n\n"
+                "У вас уже была подписка, поэтому к текущему сроку добавлен <b>+3 дня</b>.\n\n"
                 f"📅 Новая дата окончания: <b>{expires_date}</b>\n\n"
                 "Ключ не меняется — проверьте раздел «Профиль»."
             )
@@ -1041,8 +1114,8 @@ async def handle_pay_callback(callback: CallbackQuery) -> None:
             await callback.answer()
             return
 
-        # Активной подписки нет — выдаём новый API-ключ на 1 день
-        result = await issue_subscription_key(user.id, 1, None)
+        # Активной подписки нет — выдаём новый API-ключ на 3 дня
+        result = await issue_subscription_key(user.id, 3, None)
         if not result:
             await callback.message.answer(
                 "❌ Не удалось оформить пробную подписку (ошибка API). Попробуйте позже или обратитесь к администратору."
@@ -1050,16 +1123,21 @@ async def handle_pay_callback(callback: CallbackQuery) -> None:
             await callback.answer()
             return
 
-        key_or_link, _ = result
+        key_or_link, _, expires_at = result
         await mark_trial_used(user.id)
-        expires_date = (dt.datetime.utcnow() + dt.timedelta(days=days)).strftime("%Y-%m-%d")
+        expires_date = (
+            expires_at.split("T")[0]
+            if expires_at and "T" in expires_at
+            else (expires_at[:10] if expires_at else (dt.datetime.utcnow() + dt.timedelta(days=days)).strftime("%Y-%m-%d"))
+        )
         text = (
-            "🆓 Вам выдан <b>пробный период на 1 день</b>.\n\n"
+            "🆓 Вам выдан <b>пробный период на 3 дня</b>.\n\n"
             f"📅 Активен до: <b>{expires_date}</b>\n\n"
             f"🔑 Ваша ссылка для подключения:\n<code>{key_or_link}</code>\n\n"
             "📘 Инструкция по установке: https://telegra.ph/Kak-podklyuchit-VPN-za-1-minutu-02-13\n\n"
             "👤 Ключ также доступен в разделе «Профиль»."
         )
+        link_preview_options=LinkPreviewOptions(is_disabled=True)
         await callback.message.answer(text, parse_mode=ParseMode.HTML)
         await callback.answer()
         return
@@ -1180,12 +1258,21 @@ async def handle_admin_payment_callback(callback: CallbackQuery) -> None:
         )
         return
 
-    key_or_link, is_api = result
+    key_or_link, is_api, expires_at = result
     issued_count = len(await list_used_keys())
-    expires_date = (dt.datetime.utcnow() + dt.timedelta(days=days)).strftime("%Y-%m-%d")
+    expires_date = (
+        expires_at.split("T")[0]
+        if expires_at and "T" in expires_at
+        else (expires_at[:10] if expires_at else (dt.datetime.utcnow() + dt.timedelta(days=days)).strftime("%Y-%m-%d"))
+    )
     key_label = "ссылка для подключения" if is_api else "ключ доступа"
 
     try:
+        user_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Вернуться в главное меню", callback_data="main_menu")]
+            ]
+        )
         await callback.message.bot.send_message(
             chat_id=user_tg_id,
             text=(
@@ -1197,6 +1284,7 @@ async def handle_admin_payment_callback(callback: CallbackQuery) -> None:
                 "👤 Ключ также можно посмотреть в разделе «Профиль»."
             ),
             parse_mode=ParseMode.HTML,
+            reply_markup=user_kb,
         )
     except Exception as e:
         logger.warning(f"Не удалось отправить ключ пользователю {user_tg_id}: {e}")
@@ -1215,26 +1303,6 @@ async def handle_admin_payment_callback(callback: CallbackQuery) -> None:
         pass
 
     await callback.answer("✅ Оплата подтверждена и ключ выдан.")
-
-
-async def handle_buy_close_callback(callback: CallbackQuery) -> None:
-    """
-    Кнопка «Закрыть» под формой покупки.
-    Просто убирает сообщение или клавиатуру.
-    """
-    if not callback.message:
-        await callback.answer()
-        return
-
-    try:
-        await callback.message.delete()
-    except Exception:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-    await callback.answer("Ок ✅")
 
 
 async def handle_check_subscription_callback(callback: CallbackQuery) -> None:
@@ -1429,7 +1497,7 @@ async def cmd_grant_subscription(message: Message) -> None:
                 InlineKeyboardButton(text="90 дней", callback_data="grant_90"),
             ],
             [
-                InlineKeyboardButton(text="180 дней", callback_data="grant_180"),
+                InlineKeyboardButton(text="180 дней (6 мес.)", callback_data="grant_180"),
                 InlineKeyboardButton(text="∞ Бесконечность", callback_data="grant_inf"),
             ],
             [
@@ -1523,11 +1591,15 @@ async def handle_grant_user_id(message: Message) -> None:
         )
         return
 
-    key_or_link, is_api = result
+    key_or_link, is_api, expires_at = result
     issued_count = len(await list_used_keys())
     days_text = "бесконечность" if days == 0 else f"{days} дней"
     if days > 0:
-        expires_date = (dt.datetime.utcnow() + dt.timedelta(days=days)).strftime("%Y-%m-%d")
+        expires_date = (
+            expires_at.split("T")[0]
+            if expires_at and "T" in expires_at
+            else (expires_at[:10] if expires_at else (dt.datetime.utcnow() + dt.timedelta(days=days)).strftime("%Y-%m-%d"))
+        )
         expires_text = f"📅 Активна до: <b>{expires_date}</b>\n"
     else:
         expires_text = "📅 Активна: <b>бессрочно</b>\n"
@@ -2142,6 +2214,7 @@ async def show_referral_system(message: Message) -> None:
                     callback_data="copy_referral_link",
                 )
             ],
+            [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="main_menu")],
         ]
     )
     
@@ -2191,31 +2264,264 @@ async def show_support(message: Message) -> None:
     if not await ensure_subscribed(message):
         return
 
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Написать в поддержку", url="https://t.me/r5net")],
+            [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="main_menu")],
+        ]
+    )
     await message.answer(
         "🆘 <b>Поддержка</b>\n\n"
         "Если вы столкнулись с проблемами, сбоями VPN или есть вопросы — пишите:\n"
-        "👤 @r5net или 👤 @juckmyass"
+        "👤 @r5net",
+        reply_markup=kb,
     )
+
+
+# ===== CORRECT NAVIGATION CALLBACKS =====
+async def handle_main_menu_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+
+    try:
+        bot_info = await callback.bot.get_me()
+        bot_username = bot_info.username or "vpnkometa_bot"
+    except Exception:
+        bot_username = "vpnkometa_bot"
+
+    referral_link = f"https://t.me/{bot_username}?start={callback.from_user.id}"
+    text = (
+        "✨ Добро пожаловать в <b>Kometa VPN</b>! ✨\n"
+        "⚡ Быстрый и дешёвый VPN-сервис!\n\n"
+        "📄 Пользовательское соглашение: https://telegra.ph/Polzovatelskoe-soglashenie-02-12-23\n\n"
+        f"📢 Чтобы пользоваться ботом, убедитесь, что вы подписаны на канал: {REQUIRED_CHANNEL}\n\n"
+        "🚀 <b>Как начать?</b>\n"
+        "1️⃣ Нажмите кнопку «Купить подписку» ниже\n"
+        "2️⃣ Выберите пробный период (3 дня) или платный тариф\n"
+        "3️⃣ Получите ключ и настройте VPN\n\n"
+        "🎁 <b>Реферальная система</b>\n"
+        "Пригласи друга и получи <b>3 дня</b> подписки!\n"
+        f"Твоя ссылка: <code>{referral_link}</code>\n\n"
+        "💡 Используй кнопку «Реферальная система» в меню для получения своей реферальной ссылки!"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📋 Профиль", callback_data="profile"),
+                InlineKeyboardButton(text="💳 Купить подписку", callback_data="buy"),
+            ],
+            [
+                InlineKeyboardButton(text="🤝 Реферальная система", callback_data="referral"),
+                InlineKeyboardButton(text="📞 Поддержка", callback_data="support"),
+            ],
+        ]
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def handle_profile_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+
+    user_with_sub = await get_user_with_subscription(callback.from_user.id)
+    if not user_with_sub:
+        user = await get_or_create_user(
+            telegram_id=callback.from_user.id,
+            username=callback.from_user.username,
+            first_name=callback.from_user.first_name,
+            referrer_id=None,
+        )
+        sub = None
+    else:
+        user, sub = user_with_sub
+
+    show_replace_button = False
+    if sub is None:
+        display_status = "Нет подписки"
+        extra_lines: list[str] = []
+    else:
+        sub_status = sub.get("status", "unknown")
+        expires = sub.get("expires_at")
+        key = sub.get("payment_reference")
+        extra_lines = []
+        if sub_status == "active":
+            if expires:
+                try:
+                    from datetime import datetime
+
+                    if "T" in expires:
+                        expires_date = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                    else:
+                        expires_date = datetime.fromisoformat(expires + "T23:59:59")
+                    now = datetime.utcnow()
+                    if expires_date > now:
+                        display_status = "Активна"
+                        days_left = (expires_date - now).days
+                        if days_left == 0:
+                            extra_lines.append("Истекает сегодня")
+                        elif days_left == 1:
+                            extra_lines.append("Истекает завтра")
+                        else:
+                            extra_lines.append(f"Истекает: {expires_date.strftime('%Y-%m-%d')} ({days_left} дней)")
+                    else:
+                        display_status = "Истекла"
+                        extra_lines.append("Срок действия подписки истек")
+                except Exception:
+                    display_status = "Активна"
+                    extra_lines.append(f"Истекает: {expires.split('T')[0] if 'T' in expires else expires[:10]}")
+            else:
+                display_status = "Активна"
+                extra_lines.append("Без ограничения срока")
+
+            if display_status == "Активна" and key:
+                if user.get("is_api_user") and user.get("v2ray_uuid"):
+                    display_key = generate_vless_link(
+                        user["v2ray_uuid"],
+                        f"Kometa-tg_{user.get('telegram_id', '')}",
+                    )
+                    extra_lines.append(f"Ваша ссылка для подключения:\n<code>{display_key}</code>")
+                else:
+                    extra_lines.append(f"Ваш ключ: {key}")
+                show_replace_button = True
+        elif sub_status == "expired":
+            display_status = "Истекла"
+            extra_lines.append("Срок действия подписки истек")
+        elif sub_status == "revoked":
+            display_status = "Отозвана"
+            extra_lines.append("Подписка отозвана администратором")
+        elif sub_status == "pending":
+            display_status = "Ожидает подтверждения"
+        else:
+            display_status = sub_status
+
+    extra = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+    if user.get("username"):
+        header = (
+            "👤 <b>Ваш профиль</b>:\n"
+            f"Имя: {user.get('first_name')}\n"
+            f"Юзернейм: @{user.get('username')}"
+        )
+    else:
+        header = f"👤 <b>Ваш профиль</b>:\nИмя: {user.get('first_name')}\n"
+    text = header + f"\n💼 Статус подписки: {display_status}{extra}"
+
+    rows = []
+    if show_replace_button:
+        rows.append([InlineKeyboardButton(text="🔁 Заменить ключ", callback_data="replace_key")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+async def handle_buy_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+
+    text = (
+        "💳 <b>Выберите длительность подписки</b>:\n\n"
+        "🆓 Пробный период (3 дня) — бесплатно, можно получить только один раз\n"
+        "📅 30 дней — 80 ₽\n"
+        "💰 90 дней — 200 ₽\n"
+        "👑 180 дней — 350 ₽\n"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🆓 Пробный период (3 дня)", callback_data="sub_trial")],
+            [InlineKeyboardButton(text="📅 30 дней", callback_data="sub_30")],
+            [InlineKeyboardButton(text="💰 90 дней", callback_data="sub_90")],
+            [InlineKeyboardButton(text="👑 180 дней", callback_data="sub_180")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+
+async def handle_referral_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+
+    try:
+        bot_info = await callback.bot.get_me()
+        bot_username = bot_info.username or "vpnkometa_bot"
+    except Exception:
+        bot_username = "vpnkometa_bot"
+
+    referral_link = f"https://t.me/{bot_username}?start={callback.from_user.id}"
+    user = await get_user_by_telegram_id(callback.from_user.id)
+    referral_count = user.get("referral_count", 0) if user else 0
+    text = (
+        "🎁 <b>Реферальная система</b>\n\n"
+        "💎 <b>Как получить 3 дня подписки?</b>\n"
+        "1️⃣ Скопируй свою реферальную ссылку\n"
+        "2️⃣ Отправь её другу\n"
+        "3️⃣ Друг должен перейти по ссылке и подписаться на канал\n"
+        "4️⃣ После успешной регистрации друга тебе автоматически начисляется <b>3 дня</b> подписки!\n\n"
+        "📊 <b>Твоя статистика:</b>\n"
+        f"👥 Приглашено друзей: <b>{referral_count}</b>\n\n"
+        f"🔗 <b>Твоя реферальная ссылка:</b>\n"
+        f"<code>{referral_link}</code>\n\n"
+        "💡 <i>Нажми кнопку ниже, чтобы скопировать ссылку</i>"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Копировать ссылку", callback_data="copy_referral_link")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]
+    )
+    await callback.message.edit_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def handle_support_callback(callback: CallbackQuery) -> None:
+    if not callback.message:
+        await callback.answer()
+        return
+    await callback.answer()
+    text = (
+        "🆘 <b>Поддержка</b>\n\n"
+        "Если вы столкнулись с проблемами, сбоями VPN или есть вопросы — пишите:\n"
+        "👤 @r5net"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Написать в поддержку", url="https://t.me/r5net")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]
+    )
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
 
 
 async def on_message_text(message: Message) -> None:
     if not await ensure_subscribed(message):
         return
 
-    # Поддерживаем как варианты без эмодзи, так и с ними (на всякий случай)
-    if message.text in ("Профиль", "👤 Профиль"):
+    if message.text == "Профиль":
         await show_profile(message)
-    elif message.text in ("Купить подписку", "💳 Купить подписку"):
+    elif message.text == "Купить подписку":
         await show_buy_info(message)
-    elif message.text in ("Реферальная система", "🎁 Реферальная система"):
+    elif message.text == "Реферальная система":
         await show_referral_system(message)
-    elif message.text in ("Поддержка", "🆘 Поддержка"):
+    elif message.text == "Поддержка":
         await show_support(message)
     else:
-        await message.answer(
-            "❓ Неизвестная команда.\n"
-            "Используйте кнопки меню или команду /help."
-        )
+        await message.answer("❓ Неизвестная команда. Используйте кнопки меню или /help.")
 
 
 async def main() -> None:
@@ -2256,7 +2562,6 @@ async def main() -> None:
     dp.callback_query.register(handle_subscription_duration_callback, F.data.startswith("sub_"))
     dp.callback_query.register(handle_replace_key_callback, F.data == "replace_key")
     dp.callback_query.register(handle_pay_callback, F.data.startswith("pay_"))
-    dp.callback_query.register(handle_buy_close_callback, F.data == "buy_close")
     dp.callback_query.register(handle_check_subscription_callback, F.data.startswith("check_subscription"))
     dp.callback_query.register(handle_reset_keys_callback, F.data.startswith("rk_"))
     dp.callback_query.register(handle_grant_callback, F.data.startswith("grant_"))
@@ -2265,6 +2570,13 @@ async def main() -> None:
         handle_admin_payment_callback,
         (F.data.startswith("admin_confirm_") | F.data.startswith("admin_decline_")),
     )
+    
+    # Navigation callbacks
+    dp.callback_query.register(handle_main_menu_callback, F.data == "main_menu")
+    dp.callback_query.register(handle_profile_callback, F.data == "profile")
+    dp.callback_query.register(handle_buy_callback, F.data == "buy")
+    dp.callback_query.register(handle_referral_callback, F.data == "referral")
+    dp.callback_query.register(handle_support_callback, F.data == "support")
 
     async def admin_text_handler(message: Message) -> None:
         if is_admin(message.from_user.id) and message.text and message.text.strip().isdigit():
@@ -2293,8 +2605,26 @@ async def main() -> None:
     
     dp.message.register(admin_text_handler, F.text)
 
-    logger.info("Bot starting...")
-    await dp.start_polling(bot)
+    retry_delay = 5
+    while True:
+        try:
+            logger.info("Bot starting...")
+            await dp.start_polling(bot)
+            break
+        except TelegramNetworkError as e:
+            logger.warning(
+                "Telegram network error while polling: %s. Retrying in %s seconds...",
+                e,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+        except Exception as e:
+            logger.exception(
+                "Unexpected polling error: %s. Retrying in %s seconds...",
+                e,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
 
 
 if __name__ == "__main__":

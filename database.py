@@ -507,9 +507,10 @@ async def extend_active_subscription_by_days(
             expires_at = sub_row["expires_at"]
             if expires_at:
                 try:
-                    part = expires_at.split("T")[0] if "T" in expires_at else expires_at[:10]
-                    y, m, d = map(int, part.split("-"))
-                    current_end = dt.datetime(y, m, d)
+                    normalized = str(expires_at).replace("Z", "+00:00")
+                    current_end = dt.datetime.fromisoformat(normalized)
+                    if current_end.tzinfo is not None:
+                        current_end = current_end.astimezone(dt.timezone.utc).replace(tzinfo=None)
                     if current_end > now:
                         # Subscription is still active, extend from current expiry date
                         base_date = current_end
