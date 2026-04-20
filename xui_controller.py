@@ -15,12 +15,28 @@ logger = logging.getLogger(__name__)
 VLESS_ADDRESS = os.getenv("VLESS_ADDRESS", "193.109.69.12")
 VLESS_PORT = int(os.getenv("VLESS_PORT", "443"))
 VLESS_SNI = os.getenv("VLESS_SNI", "swcdn.apple.com")
-VLESS_PBK = os.getenv("VLESS_PBK", "rDtrdaOeBOcS_I9guoqGI6zb0m-b2PvDcaQQrXL8jEs")
-VLESS_SID = os.getenv("VLESS_SID", "ce4534464e5b33")
+VLESS_PBK = os.getenv("VLESS_PBK", "V6zkalrAPp-Hc6m6tSw4OMclfaxOJSdGMxNwVU3kOgA")
+VLESS_SID = os.getenv("VLESS_SID", "3db9a12c")
 VLESS_FLOW = os.getenv("VLESS_FLOW", "xtls-rprx-vision")
 VLESS_SECURITY = os.getenv("VLESS_SECURITY", "reality")
 VLESS_FP = os.getenv("VLESS_FP", "chrome") 
 VLESS_SPX = os.getenv("VLESS_SPX", "%2F") 
+
+
+def _normalize_client_id(raw: object) -> str:
+    """
+    Нормализует идентификатор клиента до uuid-подобной строки:
+    - обрезает пробелы
+    - поддерживает случай, когда в БД сохранена целиком vless-ссылка
+    - приводит к lower-case для безопасного сравнения
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith("vless://"):
+        payload = text[len("vless://"):]
+        text = payload.split("@", 1)[0]
+    return text.lower()
 
 
 def generate_vless_link(uuid: str, remark: Optional[str] = None) -> str:
@@ -211,26 +227,77 @@ class XUIController:
                 continue
         return None
 
+    async def _get_all_inbound_objs(self) -> list[dict]:
+        """
+        Возвращает список inbound-объектов.
+        Нужен как fallback, когда клиент находится не в self.inbound_id.
+        """
+        session = await self._get_session()
+        urls_to_try = (
+            urljoin(self.base_url, "panel/api/inbounds/list"),
+            urljoin(self.base_url, "panel/inbound/list"),
+        )
+        for url in urls_to_try:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                    if not data:
+                        continue
+                    obj = data.get("obj")
+                    if isinstance(obj, list):
+                        return [x for x in obj if isinstance(x, dict)]
+                    if isinstance(data, list):
+                        return [x for x in data if isinstance(x, dict)]
+            except Exception:
+                continue
+        return []
+
     async def extend_client_expiry_by_days(self, client_uuid: str, days: int) -> bool:
         from datetime import datetime, timedelta
 
-        obj = await self._get_inbound_obj()
-        if not obj:
-            logger.warning("XUI extend_client_expiry: inbound not found")
-            return False
-        settings_raw = obj.get("settings")
-        if not settings_raw:
-            return False
-        settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
-        clients = settings.get("clients") or []
+        requested_uuid = _normalize_client_id(client_uuid)
+
+        target_obj = await self._get_inbound_obj()
+        target_inbound_id = self.inbound_id
         found = None
-        for c in clients:
-            if c.get("id") == client_uuid:
-                found = c
-                break
+        settings = None
+
+        if target_obj:
+            settings_raw = target_obj.get("settings")
+            if settings_raw:
+                settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+                clients = settings.get("clients") or []
+                for c in clients:
+                    if _normalize_client_id(c.get("id")) == requested_uuid:
+                        found = c
+                        break
+
+        # Fallback: клиент может быть в другом inbound (например, после миграции/ручной выдачи)
         if not found:
+            for inbound_obj in await self._get_all_inbound_objs():
+                settings_raw = inbound_obj.get("settings")
+                if not settings_raw:
+                    continue
+                local_settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+                clients = local_settings.get("clients") or []
+                local_found = None
+                for c in clients:
+                    if _normalize_client_id(c.get("id")) == requested_uuid:
+                        local_found = c
+                        break
+                if local_found:
+                    found = local_found
+                    settings = local_settings
+                    target_obj = inbound_obj
+                    target_inbound_id = int(inbound_obj.get("id") or self.inbound_id)
+                    break
+
+        if not found or not settings or not target_obj:
             logger.warning("XUI extend_client_expiry: client uuid=%s not found", client_uuid)
             return False
+
         now_ms = int(datetime.utcnow().timestamp() * 1000)
         current_expiry = found.get("expiryTime") or 0
         if current_expiry <= 0:
@@ -243,14 +310,19 @@ class XUIController:
                 new_expiry_ms = int((datetime.utcnow() + timedelta(days=days)).timestamp() * 1000)
         found["expiryTime"] = new_expiry_ms
         settings_str = json.dumps(settings)
-        update_body = {"id": self.inbound_id, "settings": settings_str}
+        update_body = {"id": target_inbound_id, "settings": settings_str}
         session = await self._get_session()
-        url = urljoin(self.base_url, "panel/api/inbounds/update/" + str(self.inbound_id))
+        url = urljoin(self.base_url, "panel/api/inbounds/update/" + str(target_inbound_id))
         try:
             async with session.post(url, json=update_body) as resp:
                 text = await resp.text()
                 if resp.status == 200:
-                    logger.info("XUI extend_client_expiry: uuid=%s, days=%s, status=success", client_uuid, days)
+                    logger.info(
+                        "XUI extend_client_expiry: uuid=%s, days=%s, inbound_id=%s, status=success",
+                        client_uuid,
+                        days,
+                        target_inbound_id,
+                    )
                     return True
                 logger.warning("XUI extend_client_expiry: status=failed, http=%s body=%s", resp.status, text[:200])
                 return False
