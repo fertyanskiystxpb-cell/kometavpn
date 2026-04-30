@@ -449,9 +449,9 @@ async def process_referral_after_subscription(user_id: int, referrer_id: int, bo
 
 async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
     """
-    Реферальный бонус: тип ключа пригласившего определяет логику.
-    - Legacy (.txt): только уведомление, подписку не продлеваем.
-    - API: при активной подписке — +3 дня в панели и в БД; при отсутствии — выдача ключа через API.
+    Реферальный бонус: работает аналогично пробному периоду.
+    - При активной подписке — продлеваем текущую на +3 дня (без создания нового клиента)
+    - При отсутствии активной подписки — создаём нового API-клиента на 3 дня
     """
     logger.info("process_referral_bonus: referrer_id=%s", referrer_id)
 
@@ -460,128 +460,106 @@ async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
         logger.error("process_referral_bonus: referrer_id=%s, status=referrer_not_found", referrer_id)
         return
 
-    is_api_referrer = bool(referrer.get("is_api_user"))
     has_active = await has_active_subscription(referrer_id)
-    logger.info("process_referral_bonus: referrer_id=%s, key_type=%s, has_active=%s", referrer_id, "API" if is_api_referrer else "Legacy", has_active)
+    logger.info("process_referral_bonus: referrer_id=%s, has_active=%s", referrer_id, has_active)
 
+    # Если подписка уже есть, просто добавляем 3 дня к текущему сроку (без нового ключа)
     if has_active:
-        if is_api_referrer:
-            # API-ключ: продлеваем в панели и в БД на 3 дня
-            uuid_str = referrer.get("v2ray_uuid")
-            if not uuid_str:
-                logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=no_uuid", referrer_id)
-                return
-            controller = get_xui()
-            if not await controller.ensure_logged_in():
-                logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=login_failed", referrer_id)
-                return
-            panel_ok = await controller.extend_client_expiry_by_days(uuid_str, 3)
-            if not panel_ok:
-                logger.warning("process_referral_bonus: referrer_id=%s, key_type=API, status=panel_extend_failed", referrer_id)
-            extended = await extend_active_subscription_by_days(referrer_id, 3)
-            if not extended:
-                logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=db_extend_failed", referrer_id)
-                return
-            logger.info("process_referral_bonus: referrer_id=%s, key_type=API, status=extended_3d, panel_ok=%s", referrer_id, panel_ok)
-            expires_at = extended.get("expires_at") or ""
-            expires_display = expires_at.split("T")[0] if expires_at and "T" in expires_at else (expires_at[:10] if expires_at else "—")
-            username = f"@{referrer.get('username')}" if referrer.get('username') else "нет username"
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        chat_id=admin_id,
-                        text=(
-                            "🎁 <b>Реферальный бонус (+3 дня в профиль)</b>\n\n"
-                            f"👤 Кто пригласил: {referrer.get('first_name', '')} {username}\n"
-                            f"🆔 TG ID: <code>{referrer_id}</code> (API-ключ)\n"
-                            f"📅 Подписка продлена до: {expires_display}\n\n"
-                            "Подписка продлена в панели и в БД."
-                        ),
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception as e:
-                    logger.error("Не удалось отправить сообщение админу %s: %s", admin_id, e)
-            try:
-                await bot.send_message(
-                    chat_id=referrer_id,
-                    text=(
-                        "🎉 <b>Реферальный бонус!</b>\n\n"
-                        "Твой друг зарегистрировался по твоей ссылке.\n"
-                        "В твой профиль начислено <b>+3 дня</b> подписки.\n\n"
-                        "Ключ не меняется — проверь раздел «Профиль»."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e:
-                logger.warning("Не удалось уведомить реферера %s: %s", referrer_id, e)
-        else:
-            # Legacy-ключ: продлеваем только в БД на 3 дня
-            extended = await extend_active_subscription_by_days(referrer_id, 3)
-            if not extended:
-                logger.error(
-                    "process_referral_bonus: referrer_id=%s, key_type=Legacy, status=db_extend_failed",
-                    referrer_id,
-                )
-                return
-            expires_at = extended.get("expires_at") or ""
-            expires_display = (
-                expires_at.split("T")[0] if expires_at and "T" in expires_at else (expires_at[:10] if expires_at else "—")
-            )
-            logger.info(
-                "process_referral_bonus: referrer_id=%s, key_type=Legacy, status=extended_3d", referrer_id
-            )
-            try:
-                await bot.send_message(
-                    chat_id=referrer_id,
-                    text=(
-                        "🎉 <b>Реферальный бонус!</b>\n\n"
-                        "Твой друг зарегистрировался по твоей ссылке.\n"
-                        "В твой профиль начислено <b>+3 дня</b> подписки.\n\n"
-                        f"📅 Новая дата окончания: <b>{expires_display}</b>\n\n"
-                        "Твой ключ не меняется — проверь раздел «Профиль»."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception as e:
-                logger.warning("Не удалось уведомить реферера (Legacy) %s: %s", referrer_id, e)
-        return
+        db_user = await get_user_by_telegram_id(referrer_id)
+        is_api = bool(db_user and db_user.get("is_api_user") and db_user.get("v2ray_uuid"))
 
-    # Активной подписки нет — проверяем, есть ли клиент в 3x-ui
-    controller = get_xui()
-    if not await controller.ensure_logged_in():
-        logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=login_failed", referrer_id)
-        return
-    
-    # Проверяем, есть ли уже клиент в 3x-ui
-    existing_uuid = await controller._get_client_uuid_by_email(f"tg_{referrer_id}")
-    
-    if existing_uuid:
-        # Клиент существует - продлеваем его
-        logger.info("process_referral_bonus: referrer_id=%s, found_existing_client=%s", referrer_id, existing_uuid)
-        panel_ok = await controller.extend_client_expiry_by_days(existing_uuid, 3)
-        if not panel_ok:
-            logger.warning("process_referral_bonus: referrer_id=%s, key_type=API, status=panel_extend_failed", referrer_id)
-        
-        # Создаем/обновляем подписку в БД
+        if is_api:
+            controller = get_xui()
+            if await controller.ensure_logged_in():
+                panel_ok = await controller.extend_client_expiry_by_days(db_user["v2ray_uuid"], 3)
+                if not panel_ok:
+                    logger.warning(
+                        "referral_bonus_extend: user_id=%s, key_type=API, status=panel_extend_failed", referrer_id
+                    )
+
         extended = await extend_active_subscription_by_days(referrer_id, 3)
         if not extended:
-            logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=db_extend_failed", referrer_id)
+            logger.error("process_referral_bonus: referrer_id=%s, status=db_extend_failed", referrer_id)
             return
+
+        expires_at = extended.get("expires_at") or ""
+        expires_date = (
+            expires_at.split("T")[0] if expires_at and "T" in expires_at else (expires_at[:10] if expires_at else "—")
+        )
         
-        # Обновляем связь с API клиентом
-        await set_user_api_client(referrer_id, existing_uuid)
+        logger.info("process_referral_bonus: referrer_id=%s, status=extended_3d", referrer_id)
         
-        key_or_link = generate_vless_link(existing_uuid, f"Kometa-tg_{referrer_id}")
-        logger.info("process_referral_bonus: referrer_id=%s, key_type=API, status=extended_existing_3d", referrer_id)
-    else:
-        # Клиента нет - создаем нового
-        logger.info("process_referral_bonus: referrer_id=%s, no_existing_client", referrer_id)
-        result = await issue_subscription_key(referrer_id, 3, None)
-        if not result:
-            logger.error("process_referral_bonus: referrer_id=%s, key_type=API, status=issue_failed", referrer_id)
-            return
-        key_or_link, _, _ = result
-        logger.info("process_referral_bonus: referrer_id=%s, key_type=API, status=created_new_3d", referrer_id)
+        username = f"@{referrer.get('username')}" if referrer.get('username') else "нет username"
+        
+        # Уведомляем админов
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "🎁 <b>Реферальный бонус (+3 дня в профиль)</b>\n\n"
+                        f"👤 Кто пригласил: {referrer.get('first_name', '')} {username}\n"
+                        f"🆔 TG ID: <code>{referrer_id}</code>\n"
+                        f"📅 Подписка продлена до: {expires_date}\n\n"
+                        "Подписка продлена в панели и в БД."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.error("Не удалось отправить сообщение админу %s: %s", admin_id, e)
+        
+        # Уведомляем реферера
+        try:
+            await bot.send_message(
+                chat_id=referrer_id,
+                text=(
+                    "🎉 <b>Реферальный бонус!</b>\n\n"
+                    "Твой друг зарегистрировался по твоей ссылке.\n"
+                    "В твой профиль начислено <b>+3 дня</b> подписки.\n\n"
+                    f"📅 Новая дата окончания: <b>{expires_date}</b>\n\n"
+                    "Ключ не меняется — проверь раздел «Профиль»."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.warning("Не удалось уведомить реферера %s: %s", referrer_id, e)
+        return
+
+    # Активной подписки нет — выдаём новый API-ключ на 3 дней
+    result = await issue_subscription_key(referrer_id, 3, None)
+    if not result:
+        logger.error("process_referral_bonus: referrer_id=%s, status=issue_failed", referrer_id)
+        return
+
+    key_or_link, _, expires_at = result
+    expires_date = (
+        expires_at.split("T")[0]
+        if expires_at and "T" in expires_at
+        else (expires_at[:10] if expires_at else (dt.datetime.utcnow() + dt.timedelta(days=3)).strftime("%Y-%m-%d"))
+    )
+    
+    logger.info("process_referral_bonus: referrer_id=%s, status=created_new_3d", referrer_id)
+    
+    username = f"@{referrer.get('username')}" if referrer.get('username') else "нет username"
+    
+    # Уведомляем админов
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "🎁 <b>Реферальный бонус (новый клиент 3 дня)</b>\n\n"
+                    f"👤 Реферер: {referrer.get('first_name', '')} {username}\n"
+                    f"🆔 TG ID: <code>{referrer_id}</code>\n"
+                    f"📅 Выдана подписка до: {expires_date}\n"
+                    f"🔑 Ссылка: <code>{key_or_link[:80]}...</code>\n\n"
+                    "Создан новый API-клиент в панели."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error("Не удалось отправить сообщение админу %s: %s", admin_id, e)
+    
     try:
         await bot.send_message(
             chat_id=referrer_id,
@@ -589,7 +567,10 @@ async def process_referral_bonus(referrer_id: int, bot: Bot) -> None:
                 "🎉 <b>Реферальный бонус!</b>\n\n"
                 "Твой друг зарегистрировался по твоей ссылке.\n"
                 "Тебе начислено <b>3 дня</b> подписки!\n\n"
-                f"🔑 Твоя ссылка для подключения:\n<code>{key_or_link}</code>"
+                f"📅 Активен до: <b>{expires_date}</b>\n\n"
+                f"🔑 Твоя ссылка для подключения:\n<code>{key_or_link}</code>\n\n"
+                "📘 Инструкция по установке: https://telegra.ph/Kak-podklyuchit-VPN-za-1-minutu-02-13\n\n"
+                "👤 Ключ также доступен в разделе «Профиль»."
             ),
             parse_mode=ParseMode.HTML,
         )
